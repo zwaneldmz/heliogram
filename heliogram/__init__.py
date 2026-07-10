@@ -12,6 +12,19 @@ Public API (see spec/format-v0.1.md for the exact pinned format):
     get_palette(palette) -> list[(r, g, b)]                         # deterministic palette
     VLMDecoder                                                       # Phase-2 stub, raises NotImplementedError
 
+Phase-2 (GPU) scaffold -- see the README's "Phase 2 (GPU)" section:
+
+    write_dataset(...) / generate_examples(...)   # heliogram.dataset: synthetic training pairs,
+                                                    # CPU-only, no model required
+    QwenVLDecoder(model=..., processor=...)        # heliogram.vlm: decoder plug point for a
+                                                    # fine-tuned VLM; raises without a real model
+    zero_shot_symbol_error(model, processor, ...)  # heliogram.vlm: measures a STOCK model's
+                                                    # symbol error -- only with a real model
+
+DATA HONESTY: nothing above the Phase-2 line has been run against a real model in this repo (no
+GPU here). `import heliogram` never requires torch/transformers/peft/bitsandbytes -- see
+heliogram/vlm.py's module docstring for the lazy-import boundary.
+
 Apache-2.0. All data used by this project is synthetic and seed-deterministic.
 """
 
@@ -26,6 +39,25 @@ from .codec import (
     encode,
     get_palette,
 )
+from .dataset import (
+    Example,
+    generate_examples,
+    iter_manifest,
+    symbols_to_target,
+    target_to_symbols,
+    write_dataset,
+)
+
+try:
+    # heliogram.vlm's own top-level imports are as light as heliogram.codec's (no
+    # torch/transformers at module scope -- those are lazy inside its methods/functions), so
+    # this should always succeed. It is still wrapped in a try/except, per the Phase-2 scaffold
+    # contract: `import heliogram` must never require torch/transformers/peft/bitsandbytes, even
+    # if heliogram.vlm's import surface grows to need a guard in the future.
+    from .vlm import QwenVLDecoder, zero_shot_symbol_error
+except ImportError:  # pragma: no cover
+    QwenVLDecoder = None  # type: ignore[assignment]
+    zero_shot_symbol_error = None  # type: ignore[assignment]
 
 __all__ = [
     "CODEC_VERSION",
@@ -37,6 +69,14 @@ __all__ = [
     "decode_pixels",
     "encode",
     "get_palette",
+    "Example",
+    "generate_examples",
+    "iter_manifest",
+    "symbols_to_target",
+    "target_to_symbols",
+    "write_dataset",
+    "QwenVLDecoder",
+    "zero_shot_symbol_error",
 ]
 
 __version__ = "0.1.0"

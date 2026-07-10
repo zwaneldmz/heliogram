@@ -1,0 +1,21 @@
+# Phase 2 (GPU) scaffold dependencies -- mirrors pyproject.toml's [project.optional-dependencies]
+# "gpu" extra, for environments that install with `pip install -r` instead of the package extra.
+#
+# NOT required by the base heliogram package: `import heliogram` never needs any of these (see
+# heliogram/vlm.py's module docstring for the lazy-import boundary). Only needed for
+# scripts/train_qlora.py, scripts/gen_dataset.py does not need this file, and for actually
+# calling heliogram.vlm.QwenVLDecoder / heliogram.vlm.zero_shot_symbol_error with a real model.
+#
+# Install alongside the base package's own dependencies (pillow/numpy/reedsolo), e.g.:
+#     pip install -e .
+#     pip install -r requirements-gpu.txt
+#
+# Loosely pinned (lower bounds only) -- untested in this repo (no GPU here); pin exact versions
+# once you have verified a working combination on your hardware.
+torch>=2.1
+transformers>=4.46
+peft>=0.11
+bitsandbytes>=0.43
+accelerate>=0.30
+datasets>=2.19
+qwen-vl-utils>=0.0.8

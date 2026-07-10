@@ -17,6 +17,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+# Phase 2 (GPU) scaffold only -- QLoRA fine-tuning Qwen2.5-VL via scripts/train_qlora.py and
+# running heliogram.vlm.QwenVLDecoder/zero_shot_symbol_error for real. NOT required by the base
+# package: `import heliogram` never needs any of these (see heliogram/vlm.py's module
+# docstring). Loosely pinned; mirrored in requirements-gpu.txt for non-pyproject installs.
+gpu = [
+    "torch>=2.1",
+    "transformers>=4.46",
+    "peft>=0.11",
+    "bitsandbytes>=0.43",
+    "accelerate>=0.30",
+    "datasets>=2.19",
+    "qwen-vl-utils>=0.0.8",
+]
 
 [tool.setuptools.packages.find]
 include = ["heliogram*"]
