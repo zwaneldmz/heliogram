@@ -9,11 +9,20 @@ them back through decode_pixels (the reference, model-free decoder), and measure
                        off the clean, uncorrupted image, which is exact by construction).
   decode_success_rate  fraction of trials where decode_pixels ran to completion AND returned the
                        exact original payload.
-  bits_per_patch       subpatch^2 * bits_per_symbol * (data_patches/total_patches) *
-                       (payload_bytes/ecc_bytes), i.e. the codec's raw per-DATA-PATCH density
-                       (subpatch^2 symbols/patch) discounted by (a) the calibration row overhead
-                       and (b) the Reed-Solomon parity overhead, counted only on a successful
-                       decode (0 contribution otherwise).
+  bits_per_patch       TRUE PAYLOAD DENSITY: payload_bytes*8 / total_patches, i.e. the actual
+                       number of PAYLOAD bits (not ecc bits, not raw symbol-channel bits) carried
+                       by the WHOLE grid image (calibration row included), counted only on a
+                       successful decode (0 contribution otherwise). Earlier versions of this
+                       harness computed subpatch^2 * bits_per_symbol * (data_patches/
+                       total_patches) * (payload_bytes/ecc_bytes) instead -- that formula credited
+                       every DATA patch with carrying a full symbol drawn from the ecc bitstream,
+                       which ignores the zero-bit padding compute_grid and _pack_symbols both
+                       introduce (grid width is floored at the palette size regardless of how few
+                       symbols are needed, and the ecc bitstream is zero-padded to a whole number
+                       of symbols), so it overstated true payload density by up to ~3x at small
+                       payloads (see _bits_per_patch_on_success's docstring and
+                       tests/test_harness.py for hand-computed anchors). This field/function name
+                       is unchanged; only the formula is fixed.
   total_patches /      THE BENEFIT METRIC (see _token_crossover): total_patches is the grid's
   base64_token_est /   width*height (~1 self-hosted-VLM token/patch); base64_token_est is
   token_ratio /        ceil(payload/3)*4 (base64 chars, ~1 token/char); token_ratio =
@@ -22,6 +31,19 @@ them back through decode_pixels (the reference, model-free decoder), and measure
                        for the SAME bytes -- an accounting fact about token COUNT, independent of
                        (and computed whether or not this cell's decode_success_rate is 1.0 -- see
                        the mandatory caveat below and in RESULTS.md's "Token crossover" section).
+  lm_tokens_2x2 /      An ALTERNATIVE token accounting for the pinned Phase-2 target
+  lm_token_ratio       (Qwen2.5-VL): that model's vision-language connector merges each 2x2 block
+                       of ViT patches into ONE LM-visible token (a "spatial merger"), so the
+                       LM-visible token cost of a heliogram grid is ceil(width/2)*ceil(height/2)
+                       (lm_tokens_2x2), roughly 4x fewer than total_patches, not total_patches
+                       itself. lm_token_ratio = lm_tokens_2x2/base64_token_est is the same
+                       accounting comparison as token_ratio but against this merged-token count.
+                       MANDATORY caveat: this accounting implicitly assumes the model can read
+                       4*k^2*log2(P) bits out of ONE merged embedding (k=subpatch symbols per ViT
+                       patch, 4 ViT patches per merged LM token) -- whether it actually can is
+                       UNVERIFIED and Phase 2 work, the same epistemic class as the subpatch>1
+                       caveat below. The per-patch accounting (total_patches/token_ratio) remains
+                       the conservative headline number until Phase 2 measures this.
 
 The sweep covers every palette in heliogram.codec.VALID_PALETTES, currently (2, 4, 8, 16, 32, 64,
 128, 256) -- `PALETTES = VALID_PALETTES` below always tracks that tuple, so adding a palette to
@@ -48,13 +70,16 @@ RESULTS.md into the current working directory.
 from __future__ import annotations
 
 import csv
+import importlib.metadata
 import math
+import platform
 import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from . import baselines as _baselines_module
 from .baselines import base64_bits_per_token, rendered_text_density
 from .codec import (
     HeliogramDecodeError,
@@ -91,11 +116,43 @@ SWEEP_N_TRIALS = 3
 # and the token-crossover verdict are the bars this project's benefit claim actually rests on;
 # Gate #1 exists as a stricter, deliberately-padded bar for deciding when to START Phase 2 work.
 GATE_BITS_PER_PATCH = 8.0
+
+
+def _resolve_base64_baseline() -> object:
+    """Resolve the base64-token baseline BASE64_BITS_PER_TOKEN (and every Bar A verdict derived
+    from it, see below) is computed against: prefer a MEASURED baseline
+    (heliogram.baselines.load_measured_baseline(), added to heliogram/baselines.py by a parallel
+    work group and NOT present in every checkout -- in particular not in the worktree this
+    function was written in) over the analytic base64_bits_per_token() 6.0-bits/token assumption,
+    whenever a real measurement is actually available.
+
+    Imported defensively via getattr(...), never `from .baselines import load_measured_baseline`:
+    a hard import would raise ImportError at module load time in any checkout that lacks the
+    function yet, breaking every caller of heliogram.harness, not just this one baseline lookup.
+    Two independent ways this falls through to the analytic baseline: (a) load_measured_baseline
+    doesn't exist at all on heliogram.baselines (getattr returns None), or (b) it exists but
+    returns None itself (its own docstring: no measurement file found on this machine yet).
+
+    Returns an object exposing at minimum `.bits_per_token` (float) and `.note` (str). The
+    measured path additionally exposes `.tokenizer_id` (str) and `.chars_per_token` (float); the
+    analytic `Base64Baseline` fallback does not have a `.tokenizer_id` attribute at all, so
+    callers that want to report WHICH baseline was actually used should branch on
+    `getattr(result, "tokenizer_id", None) is not None`, not on the object's type.
+    """
+    loader = getattr(_baselines_module, "load_measured_baseline", None)
+    if loader is not None:
+        measured = loader()
+        if measured is not None:
+            return measured
+    return base64_bits_per_token()
+
+
 # Bar A -- the REAL economic bar (see module docstring / RESULTS.md "Headline"): does clean
-# bits/patch beat plain base64-in-text-context density? Derived from
-# baselines.base64_bits_per_token() itself (not a second hardcoded 6.0) so the two numbers can
-# never drift apart.
-BASE64_BITS_PER_TOKEN = base64_bits_per_token().bits_per_token
+# bits/patch beat plain base64-in-text-context density? Derived from _resolve_base64_baseline()
+# (a MEASURED tokenizer baseline when one is available, else the analytic 6.0-bits/token
+# assumption -- see that function's docstring) so this number can never silently drift from
+# whichever baseline RESULTS.md's "Baselines" section states each verdict was computed against.
+BASE64_BITS_PER_TOKEN = _resolve_base64_baseline().bits_per_token
 
 CORRUPTIONS: Dict[str, Callable] = {
     "clean": lambda img: img,
@@ -158,6 +215,12 @@ class CellResult:
     base64_token_est: int = 0
     token_ratio: float = 0.0
     heliogram_cheaper: bool = False
+    # LM-token (2x2 spatial merger) accounting fields -- see _token_crossover/_grid_stats'
+    # docstrings and the module docstring's `lm_tokens_2x2 / lm_token_ratio` entry. Same
+    # per-(palette, subpatch, payload_size)-bucket, corruption-independent property as the
+    # per-patch fields above; also defaulted for the same backward-compatibility reason.
+    lm_tokens_2x2: int = 0
+    lm_token_ratio: float = 0.0
 
 
 def _random_payload(seed: int, size: int) -> bytes:
@@ -170,7 +233,14 @@ class _GridStats:
     """Grid dimensions encode() would produce for a given (payload_len, palette, nsym, subpatch)
     -- shared by _bits_per_patch_on_success (density) and _token_crossover (patch-vs-token
     accounting) so the two metrics can never desync on the underlying grid math, unlike having
-    each recompute it separately."""
+    each recompute it separately.
+
+    `lm_tokens_2x2` is a SECOND token accounting, alongside `total_patches`: the pinned Phase-2
+    target (Qwen2.5-VL) merges every 2x2 block of ViT patches into one LM-visible token (a
+    "spatial merger"), so the LM-visible cost of a `width x height` patch grid is
+    `ceil(width/2) * ceil(height/2)`, not `width*height` -- roughly 4x fewer LM tokens for the
+    same image. See the module docstring's `lm_tokens_2x2 / lm_token_ratio` entry and
+    `_token_crossover`'s docstring for the MANDATORY caveat this accounting carries."""
 
     ecc_len: int
     num_symbols: int
@@ -178,6 +248,7 @@ class _GridStats:
     height: int
     data_patches: int
     total_patches: int
+    lm_tokens_2x2: int
 
 
 def _grid_stats(payload_len: int, palette: int, nsym: int, subpatch: int = 1) -> _GridStats:
@@ -195,6 +266,7 @@ def _grid_stats(payload_len: int, palette: int, nsym: int, subpatch: int = 1) ->
     width, height = compute_grid(data_patches_needed, palette)
     total_patches = width * height
     data_patches = width * (height - 1)
+    lm_tokens_2x2 = math.ceil(width / 2) * math.ceil(height / 2)
     return _GridStats(
         ecc_len=ecc_len,
         num_symbols=num_symbols,
@@ -202,19 +274,44 @@ def _grid_stats(payload_len: int, palette: int, nsym: int, subpatch: int = 1) ->
         height=height,
         data_patches=data_patches,
         total_patches=total_patches,
+        lm_tokens_2x2=lm_tokens_2x2,
     )
 
 
 def _bits_per_patch_on_success(
     payload_len: int, palette: int, nsym: int, subpatch: int = 1
 ) -> float:
-    """subpatch^2 * bits_per_symbol * (data_patches/total_patches) * (payload_bytes/ecc_bytes)
-    for a payload of this size -- a property of the format for given (palette, payload_len,
-    nsym, subpatch), independent of which corruption (if any) is applied."""
-    bps = bits_per_symbol(palette)
-    cells_per_patch = subpatch * subpatch
+    """TRUE PAYLOAD DENSITY (F1 fix): payload_len*8 / total_patches -- the actual number of
+    PAYLOAD bits (not ecc bits, not raw symbol-channel bits) carried by the WHOLE grid image
+    (calibration row included), for a payload of this size, on a successful decode. A property of
+    the format for given (palette, payload_len, nsym, subpatch), independent of which corruption
+    (if any) is applied.
+
+    REPLACES an earlier formula: `subpatch^2 * bits_per_symbol * (data_patches/total_patches) *
+    (payload_bytes/ecc_bytes)`. That formula treated every DATA patch as if it carried a full
+    `subpatch^2`-symbol payload drawn straight from the ecc bitstream, discounted only by (a) the
+    calibration-row row (`data_patches/total_patches`) and (b) the RS parity overhead
+    (`payload/ecc`). It missed a THIRD source of overhead `compute_grid`/`_pack_symbols`
+    introduce: `compute_grid` floors grid `width` at `palette` regardless of how few symbols are
+    actually needed (so small payloads at large palettes sit in a much wider grid than their
+    symbol count requires), and `_pack_symbols` zero-pads the ecc bitstream up to a whole number
+    of `bps`-bit symbols. Both are real, unused capacity that the old formula silently credited as
+    if it carried payload bits -- overstating true payload density by up to ~3x at small payloads
+    (e.g. P=256/subpatch=1/48B: old formula reports 2.259 bits/patch, but the true density,
+    payload_len*8/total_patches = 48*8/512, is 0.75 bits/patch).
+
+    Hand-computed sanity anchors (see tests/test_harness.py for the full derivation), all at
+    P=256/subpatch=1/nsym=32: 4096B -> total_patches=5120 -> 4096*8/5120 = 6.4 exactly; 16384B ->
+    total_patches=19200 -> 16384*8/19200 = 6.826666... ; 48B -> total_patches=512 ->
+    48*8/512 = 0.75 exactly. The `subpatch^2*log2(palette)` ceiling this value must never exceed
+    (see write_results_md's "Self-consistency checks") is UNCHANGED by this fix: payload_len*8 <=
+    ecc_len*8 <= num_symbols*bps <= data_patches*cells_per_patch*bps always holds (RS only adds
+    parity, never drops payload bits, and packing only pads up to whole symbols), and
+    total_patches > data_patches (the calibration row), so payload_len*8/total_patches is always
+    strictly less than cells_per_patch*bps -- the new, honest formula still respects the same
+    geometric ceiling as the old one, it just no longer credits padding as payload."""
     g = _grid_stats(payload_len, palette, nsym, subpatch)
-    return cells_per_patch * bps * (g.data_patches / g.total_patches) * (payload_len / g.ecc_len)
+    return payload_len * 8 / g.total_patches
 
 
 def _base64_token_estimate(payload_len: int) -> int:
@@ -232,6 +329,10 @@ class TokenCrossover:
     base64_token_est: int
     token_ratio: float
     heliogram_cheaper: bool
+    # LM-token (2x2 spatial merger) accounting -- see _grid_stats' docstring and this function's
+    # docstring for the MANDATORY caveat this pair of fields carries.
+    lm_tokens_2x2: int
+    lm_token_ratio: float
 
 
 def _token_crossover(
@@ -256,15 +357,30 @@ def _token_crossover(
     where they are token-cheaper clean -- token-cheaper is not usable on its own; only
     clean-decodable-and-token-cheaper is even a candidate benefit, and realizing it under
     corruption is conditional on Phase 2 (a learned reader), which is not measured here.
+
+    `lm_tokens_2x2`/`lm_token_ratio` are a SECOND accounting of the same comparison, against the
+    LM-visible token count Qwen2.5-VL's 2x2 spatial merger would actually present to the language
+    model (see `_grid_stats`' docstring) instead of the raw ViT-patch count `total_patches`.
+    MANDATORY caveat, same epistemic class as the subpatch>1 pixel-decoder-only caveat elsewhere
+    in this module: `lm_token_ratio` implicitly assumes the model can read `4 * subpatch**2 *
+    log2(palette)` bits out of ONE merged embedding (4 ViT patches' worth of symbols, each
+    carrying `subpatch**2 * log2(palette)` bits, folded into a single LM token by the merger) --
+    whether it actually CAN is UNVERIFIED and is Phase 2 work, not measured by this
+    (`decode_pixels`-based, pixel-exact) harness. `token_ratio`/`total_patches` remain the
+    conservative headline accounting; `lm_token_ratio` is reported alongside it, not instead of
+    it.
     """
     g = _grid_stats(payload_len, palette, nsym, subpatch)
     base64_tokens = _base64_token_estimate(payload_len)
     ratio = g.total_patches / base64_tokens
+    lm_ratio = g.lm_tokens_2x2 / base64_tokens
     return TokenCrossover(
         total_patches=g.total_patches,
         base64_token_est=base64_tokens,
         token_ratio=ratio,
         heliogram_cheaper=ratio < 1.0,
+        lm_tokens_2x2=g.lm_tokens_2x2,
+        lm_token_ratio=lm_ratio,
     )
 
 
@@ -326,6 +442,8 @@ def _run_cell(
         base64_token_est=crossover.base64_token_est,
         token_ratio=crossover.token_ratio,
         heliogram_cheaper=crossover.heliogram_cheaper,
+        lm_tokens_2x2=crossover.lm_tokens_2x2,
+        lm_token_ratio=crossover.lm_token_ratio,
     )
 
 
@@ -388,16 +506,19 @@ def format_table(results: List[CellResult]) -> str:
 
 def format_gate_table(gate_rows: List[Dict[str, object]]) -> str:
     """Render the headline Gate #1 rows (see _gate_rows) as a plain-text table for stdout.
-    Includes Bar A (`beats_base64_6`, clean-only -- see BASE64_BITS_PER_TOKEN) alongside Gate
-    #1's clean/worst/both columns, since RESULTS.md's Headline section reports both bars and
-    stdout should not silently drop the one this project considers the real economic bar."""
+    Includes Bar A (`beats_base64_N`, clean-only -- see BASE64_BITS_PER_TOKEN, whose value N is
+    baked into the column name here so the column never silently mislabels itself once
+    BASE64_BITS_PER_TOKEN comes from a measured baseline instead of the analytic 6.0 default --
+    see _resolve_base64_baseline) alongside Gate #1's clean/worst/both columns, since
+    RESULTS.md's Headline section reports both bars and stdout should not silently drop the one
+    this project considers the real economic bar."""
     headers = [
         "palette",
         "subpatch",
         "payload",
         "ceiling",
         "clean_bpp",
-        "beats_base64_6",
+        f"beats_base64_{BASE64_BITS_PER_TOKEN:.0f}",
         "worst_bpp",
         "worst_corruption",
         "clears_clean_8",
@@ -432,6 +553,38 @@ def format_gate_table(gate_rows: List[Dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def _provenance_line() -> str:
+    """One-line environment fingerprint (Python version, key dependency versions, OS/arch)
+    recorded near the top of RESULTS.md -- see B5 in the fix plan: today's committed
+    RESULTS.md/results.csv artifacts are otherwise undiagnosable when a library drifts (numpy,
+    Pillow, or reedsolo version bumps can silently change PNG container bytes, JPEG encoder
+    behavior/quality curves, or Reed-Solomon chunking/output, any of which would move the
+    numbers in this file without changing a single line of heliogram's own code -- see
+    tests/test_roundtrip.py's Pillow-12.3-pinned-hash known failure for a concrete example of
+    exactly this happening).
+
+    Versions are read via `importlib.metadata.version`, which reads the INSTALLED package's
+    dist-info metadata, not the imported module's own `__version__` attribute -- some
+    dependencies (e.g. reedsolo) don't reliably expose the latter, and the former is also more
+    honest about what's actually pip-installed in this environment (matters if a module were
+    ever vendored or monkeypatched). Falls back to "unknown" for any package whose dist-info
+    isn't found rather than raising, so this function -- and everything that calls it -- never
+    fails an otherwise-successful run just because provenance couldn't be determined.
+    """
+
+    def _ver(pkg: str) -> str:
+        try:
+            return importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            return "unknown"
+
+    return (
+        f"Python {platform.python_version()}; numpy {_ver('numpy')}; "
+        f"Pillow {_ver('Pillow')}; reedsolo {_ver('reedsolo')}; "
+        f"platform: {platform.platform()}"
+    )
+
+
 def write_csv(results: List[CellResult], path: Path) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -450,6 +603,8 @@ def write_csv(results: List[CellResult], path: Path) -> None:
                 "base64_token_est",
                 "token_ratio",
                 "heliogram_cheaper_bool",
+                "lm_tokens_2x2",
+                "lm_token_ratio",
             ]
         )
         for r in results:
@@ -468,6 +623,8 @@ def write_csv(results: List[CellResult], path: Path) -> None:
                     r.base64_token_est,
                     f"{r.token_ratio:.6f}",
                     r.heliogram_cheaper,
+                    r.lm_tokens_2x2,
+                    f"{r.lm_token_ratio:.6f}",
                 ]
             )
 
@@ -545,12 +702,13 @@ def _gate_rows(summary: Dict[Tuple[int, int, int], Dict[str, object]]) -> List[D
 
 def _token_crossover_rows(results: List[CellResult]) -> List[Dict[str, object]]:
     """One row per (palette, subpatch, payload_size) bucket for the headline Token-crossover
-    table: total_patches/base64_token_est/token_ratio/heliogram_cheaper (identical across every
-    corruption in the bucket -- see CellResult/_token_crossover -- so read off any one row in the
-    bucket, not averaged/reduced), plus the clean and jpeg_q70 decode_success_rate for that SAME
-    bucket so the token-count benefit and the pixel-decoder's actual corrupted-decode result sit
-    in the same row -- see the Headline section's mandatory caveat: token-cheaper is not the
-    same as decodable, and this is where that gets shown, not just asserted."""
+    table: total_patches/base64_token_est/token_ratio/heliogram_cheaper AND the LM-token (2x2
+    merger) accounting lm_tokens_2x2/lm_token_ratio (identical across every corruption in the
+    bucket -- see CellResult/_token_crossover -- so read off any one row in the bucket, not
+    averaged/reduced), plus the clean and jpeg_q70 decode_success_rate for that SAME bucket so
+    the token-count benefit and the pixel-decoder's actual corrupted-decode result sit in the
+    same row -- see the Headline section's mandatory caveat: token-cheaper is not the same as
+    decodable, and this is where that gets shown, not just asserted."""
     by_bucket: Dict[Tuple[int, int, int], Dict[str, object]] = {}
     for r in results:
         key = (r.palette, r.subpatch, r.payload_size)
@@ -564,6 +722,8 @@ def _token_crossover_rows(results: List[CellResult]) -> List[Dict[str, object]]:
                 "base64_token_est": r.base64_token_est,
                 "token_ratio": r.token_ratio,
                 "heliogram_cheaper": r.heliogram_cheaper,
+                "lm_tokens_2x2": r.lm_tokens_2x2,
+                "lm_token_ratio": r.lm_token_ratio,
                 "clean_decode_success": None,
                 "jpeg_q70_decode_success": None,
             },
@@ -575,29 +735,114 @@ def _token_crossover_rows(results: List[CellResult]) -> List[Dict[str, object]]:
     return [by_bucket[k] for k in sorted(by_bucket)]
 
 
-def _crossover_payload_size(
-    payload_sizes: Sequence[int], ratios: Sequence[float]
-) -> Optional[float]:
-    """Linearly interpolate (in raw payload-size bytes) the payload size where token_ratio first
-    crosses below 1.0 (heliogram becomes token-cheaper than base64 -- see _token_crossover),
-    scanning `payload_sizes`/`ratios` (same length, ascending payload order) together.
+@dataclass
+class ExactCrossover:
+    """Result of `exact_crossover_payload_size`'s byte-granular scan. `crossing_bytes` is the
+    exact smallest payload size (bytes) where the ratio first drops below 1.0, or None if it
+    never does anywhere in `[1, max_bytes_scanned]`. `recrossing_bytes` lists every payload size
+    AFTER `crossing_bytes` where the ratio goes back to >= 1.0 -- non-empty here means the
+    "crossing" reported is not a stable one-way threshold and callers MUST say so (see the
+    function's docstring: this staircase-vs-closed-form ratio is not guaranteed monotonic).
+    `lowest_ratio`/`lowest_ratio_bytes` are the minimum ratio observed anywhere in the scan and
+    the payload size at which it occurred, reported so "no crossover" can still say how close it
+    got."""
 
-    Returns None if the ratio never drops below 1.0 anywhere in the swept range. That is NOT the
-    same claim as "never crosses" -- it may cross at a larger, untested payload size -- so
-    callers must report it as "no crossover in the tested range up to <max>B", not as a hard
-    negative.
+    crossing_bytes: Optional[int]
+    recrossing_bytes: List[int]
+    max_bytes_scanned: int
+    lowest_ratio: float
+    lowest_ratio_bytes: int
+
+
+def exact_crossover_payload_size(
+    palette: int,
+    subpatch: int,
+    nsym: int,
+    token_estimator: Callable[[int], int],
+    lm_tokens: bool = False,
+    max_bytes: int = 65536,
+) -> ExactCrossover:
+    """Exact (byte-granular) replacement for the old `_crossover_payload_size`, which linearly
+    interpolated between the handful of payload sizes actually swept by the harness (48, 1024,
+    4096, 16384) and reported the result to the nearest byte (e.g. "~3055B") -- spurious
+    precision, since interpolating a STAIRCASE function (total_patches/lm_tokens_2x2 only change
+    at grid-size boundaries, not smoothly) between two widely-spaced sample points has no reason
+    to land anywhere near the function's actual crossing point.
+
+    Both sides of the ratio this function scans are closed-form for ANY payload size, not just
+    the handful the harness happens to sweep: the token-count side is `token_estimator(n)`
+    (`_base64_token_estimate`, `ceil(n/3)*4` -- exact for every n), and the patch/token side is
+    `_grid_stats(n, ...).total_patches` or `.lm_tokens_2x2` (exact for every n, mirroring
+    `encode`'s own grid math). So instead of interpolating between samples, this walks payload_len
+    = 1..max_bytes ONE BYTE AT A TIME and finds the exact smallest payload_len where
+    `numerator(payload_len) / token_estimator(payload_len) < 1.0`, where `numerator` is
+    `total_patches` (`lm_tokens=False`, the conservative per-patch accounting) or `lm_tokens_2x2`
+    (`lm_tokens=True`, the Qwen2.5-VL 2x2-merger accounting -- see `_grid_stats`'/
+    `_token_crossover`'s docstrings for the MANDATORY caveat that accounting carries).
+
+    Because the numerator is a staircase (constant between grid-size boundaries, then jumping)
+    while the denominator grows in fixed +4-per-3-bytes steps, the ratio is NOT guaranteed
+    monotonic: it can drop below 1.0, tick back up at the next grid-size jump (adding a
+    calibration-row patch that isn't there yet at the prior payload size), and cross again. This
+    function scans the FULL range (never stops early at the first crossing) so it can report
+    every such recrossing in `.recrossing_bytes` -- callers MUST check that list and describe the
+    wobble rather than silently stating a single "crosses at NB" threshold when it is non-empty,
+    per this project's data-honesty rule (see write_results_md's "Token crossover" section).
+
+    Returns `.crossing_bytes = None` if the ratio never drops below 1.0 anywhere in
+    `[1, max_bytes]`. That is NOT the same claim as "never crosses" -- it may cross at a larger,
+    unscanned payload size -- callers must report it as "no crossover found in the exact scan up
+    to <max_bytes>B", not as a hard negative (same honesty rule the old interpolating version
+    carried, just against the wider and exact -- not sampled -- range this version actually
+    covers).
     """
-    if not payload_sizes:
-        return None
-    if ratios[0] < 1.0:
-        return float(payload_sizes[0])  # already cheaper at the smallest tested size
-    for i in range(1, len(payload_sizes)):
-        r0, r1 = ratios[i - 1], ratios[i]
-        if r0 >= 1.0 and r1 < 1.0:
-            p0, p1 = payload_sizes[i - 1], payload_sizes[i]
-            frac = (r0 - 1.0) / (r0 - r1)
-            return p0 + frac * (p1 - p0)
-    return None
+    crossing: Optional[int] = None
+    recrossing: List[int] = []
+    prev_below = False
+    lowest_ratio: Optional[float] = None
+    lowest_ratio_bytes = 0
+    for payload_len in range(1, max_bytes + 1):
+        g = _grid_stats(payload_len, palette, nsym, subpatch)
+        numerator = g.lm_tokens_2x2 if lm_tokens else g.total_patches
+        tokens = token_estimator(payload_len)
+        ratio = numerator / tokens if tokens else math.inf
+        if lowest_ratio is None or ratio < lowest_ratio:
+            lowest_ratio = ratio
+            lowest_ratio_bytes = payload_len
+        below = ratio < 1.0
+        if below and crossing is None:
+            crossing = payload_len
+        elif crossing is not None and prev_below and not below:
+            recrossing.append(payload_len)
+        prev_below = below
+    return ExactCrossover(
+        crossing_bytes=crossing,
+        recrossing_bytes=recrossing,
+        max_bytes_scanned=max_bytes,
+        lowest_ratio=lowest_ratio if lowest_ratio is not None else 0.0,
+        lowest_ratio_bytes=lowest_ratio_bytes,
+    )
+
+
+def _describe_exact_crossover(result: ExactCrossover, label: str) -> str:
+    """Render one `ExactCrossover` (see `exact_crossover_payload_size`) as a short prose
+    fragment for the 'Crossover payload size' subsection -- shared by the per-patch and LM-token
+    accountings so the two read identically apart from which numbers they carry. `label` is
+    prepended so a line combining both reads unambiguously, e.g. "per-patch crosses at 2989B
+    (exact); LM-token crosses at 750B (exact)"."""
+    if result.crossing_bytes is None:
+        return (
+            f"{label} no crossover found in the exact scan up to {result.max_bytes_scanned}B "
+            f"(lowest ratio observed: {result.lowest_ratio:.3f} at {result.lowest_ratio_bytes}B)"
+        )
+    text = f"{label} crosses at {result.crossing_bytes}B (exact)"
+    if result.recrossing_bytes:
+        text += (
+            f" -- WOBBLES: recrosses back to >= 1.0 at {result.recrossing_bytes[0]}B (and "
+            f"{len(result.recrossing_bytes) - 1} more time(s) within the scanned range) -- NOT "
+            "a stable one-way threshold, see exact_crossover_payload_size's docstring"
+        )
+    return text
 
 
 def _token_crossover_section(
@@ -611,7 +856,11 @@ def _token_crossover_section(
     token estimate for the SAME payload, at every (palette, subpatch, payload_size) bucket in
     this sweep, with the clean and jpeg_q70 decode_success_rate for that same bucket shown in
     the same row so the token-count benefit and the pixel-decoder's actual corrupted-decode
-    result are never shown apart from each other."""
+    result are never shown apart from each other. Also includes a dedicated LM-token (Qwen2.5-VL
+    2x2 spatial merger) subsection presenting the SAME comparison against the merged, LM-visible
+    token count alongside the conservative per-patch accounting, and an exact (byte-granular, not
+    interpolated) crossover-payload-size scan for both accountings -- see
+    `exact_crossover_payload_size`."""
     crossover_rows = _token_crossover_rows(results)
     lines = [
         "## Token crossover: the actual measured benefit",
@@ -639,7 +888,10 @@ def _token_crossover_section(
         "is still 0.00 in this same sweep -- so the token-count benefit these two palettes "
         "unlock is currently a CLEAN-CHANNEL-ONLY number. Usability under real corruption is "
         "exactly the Phase-2 reader-robustness bet described in the Headline section above, "
-        "not something this table settles.",
+        "not something this table settles. This table's `total_patches` is the CONSERVATIVE, "
+        "~1-ViT-patch/token accounting; see the dedicated LM-token subsection below for the "
+        "SAME comparison against the Qwen2.5-VL 2x2-merged token count, which carries its own, "
+        "separate mandatory caveat.",
         "",
         "| palette | subpatch | payload (B) | total_patches | base64_token_est | token_ratio | "
         "cheaper on tokens? | clean decode success | jpeg_q70 decode success |",
@@ -657,22 +909,62 @@ def _token_crossover_section(
             f"{clean_str} | {jpeg_str} |"
         )
 
-    lines += ["", "### Crossover payload size per (palette, subpatch)", ""]
     lines += [
-        "For each palette, the payload size (within the swept range "
-        f"{list(payload_sizes_present)}B) where `token_ratio` first drops below 1.0, linearly "
-        "interpolated between the two nearest swept sizes when the crossing happens between "
-        "them (see `_crossover_payload_size`). 'no crossover in tested range' means the ratio "
-        "never dropped below 1.0 at any size swept here -- NOT a claim that it never will at a "
-        "larger, untested payload size.",
+        "",
+        "### LM-token accounting (Qwen2.5-VL 2x2 spatial merger)",
+        "",
+        "**MANDATORY caveat, same epistemic class as the subpatch>1 pixel-decoder-only caveat "
+        "in the Headline section above:** the table below re-accounts total token cost against "
+        "`lm_tokens_2x2 = ceil(width/2) * ceil(height/2)` -- the LM-VISIBLE token count after "
+        "Qwen2.5-VL's 2x2 spatial merger folds every 2x2 block of ViT patches into ONE token "
+        "the language model actually sees -- instead of the raw `total_patches` (ViT-patch) "
+        "count the table above uses. Because 4 ViT patches collapse into 1 merged token, this "
+        "means each merged LM token must carry `4 * subpatch**2 * log2(palette)` bits of payload "
+        "(4 patches' worth of symbols, folded into ONE merged embedding) for a reader to recover "
+        "the payload from that many LM tokens. WHETHER the model can actually read that many "
+        "symbols back out of a single merged embedding is UNVERIFIED: this harness only ever "
+        "samples exact, known pixel coordinates via `decode_pixels`/`extract_symbols` -- it "
+        "never asks a real vision encoder (merged or not) to resolve anything. Realizing (or "
+        "falsifying) this is exactly the Phase-2 GPU measurement this project has not yet done. "
+        "**The per-patch accounting in the table above remains the conservative headline "
+        "number; treat every `lm_token_ratio` / 'cheaper (LM)?' value below as an UPPER BOUND "
+        "on the possible benefit, not a result.**",
+        "",
+        "| palette | subpatch | payload (B) | total_patches | token_ratio (per-patch) | "
+        "cheaper (per-patch)? | lm_tokens_2x2 | lm_token_ratio (2x2 merger) | cheaper (LM, "
+        "UNVERIFIED)? |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in crossover_rows:
+        lines.append(
+            f"| {row['palette']} | {row['subpatch']} | {row['payload_size']} | "
+            f"{row['total_patches']} | {row['token_ratio']:.3f} | "
+            f"{'yes' if row['heliogram_cheaper'] else 'no'} | {row['lm_tokens_2x2']} | "
+            f"{row['lm_token_ratio']:.3f} | "
+            f"{'**YES**' if row['lm_token_ratio'] < 1.0 else 'no'} |"
+        )
+
+    present_pairs = sorted({(row["palette"], row["subpatch"]) for row in crossover_rows})
+    subpatch1_crossings: List[Tuple[int, int]] = []
+    exact_max_bytes = 65536
+
+    lines += ["", "### Crossover payload size per (palette, subpatch) -- exact scan", ""]
+    lines += [
+        "Exact, byte-granular payload size where each accounting's ratio first drops below "
+        "1.0 -- NOT the linear interpolation between the handful of swept sample points "
+        f"({list(payload_sizes_present)}B) an earlier version of this section used, which could "
+        "report spurious precision (e.g. '~3055B') for what is actually a staircase function "
+        "(see `exact_crossover_payload_size`'s docstring for why). Both sides of the ratio are "
+        "closed-form for ANY payload size -- `_grid_stats(...).total_patches`/`.lm_tokens_2x2` "
+        "and `ceil(n/3)*4` -- so this instead walks every payload size from 1B up to "
+        f"{exact_max_bytes}B and reports the exact smallest crossing, for BOTH the per-patch and "
+        "LM-token (2x2 merger, see the caveat above) accountings. 'no crossover found' means "
+        "the ratio never dropped below 1.0 anywhere in the scanned range -- NOT a claim it "
+        "never will at a larger, unscanned payload size. Where the ratio recrosses back above "
+        "1.0 after its first crossing (the staircase can wobble), that is reported too, rather "
+        "than silently stating a single crossing point as if it were a stable threshold.",
         "",
     ]
-    by_palette_subpatch: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
-    for row in crossover_rows:
-        key = (row["palette"], row["subpatch"])
-        by_palette_subpatch.setdefault(key, []).append((row["payload_size"], row["token_ratio"]))
-
-    subpatch1_crossings: List[Tuple[int, float]] = []
     for subpatch in subpatches_present:
         label = (
             "VLM-meaningful: one symbol per patch"
@@ -681,34 +973,32 @@ def _token_crossover_section(
         )
         lines += [f"**subpatch={subpatch} ({label}):**", ""]
         for palette in palettes_present:
-            pairs = sorted(by_palette_subpatch.get((palette, subpatch), []))
-            if not pairs:
+            if (palette, subpatch) not in present_pairs:
                 continue
-            sizes = [p for p, _ in pairs]
-            ratios = [r for _, r in pairs]
-            crossing = _crossover_payload_size(sizes, ratios)
-            worst_idx = ratios.index(min(ratios))
-            if crossing is not None:
-                lines.append(
-                    f"- palette={palette}: crosses ~{crossing:.0f}B (lowest token_ratio "
-                    f"observed in this sweep: {ratios[worst_idx]:.3f} at {sizes[worst_idx]}B)"
-                )
-                if subpatch == 1:
-                    subpatch1_crossings.append((palette, crossing))
-            else:
-                lines.append(
-                    f"- palette={palette}: no crossover in tested range up to {max(sizes)}B "
-                    f"(lowest token_ratio observed: {ratios[worst_idx]:.3f} at "
-                    f"{sizes[worst_idx]}B)"
-                )
+            per_patch = exact_crossover_payload_size(
+                palette, subpatch, NSYM, _base64_token_estimate,
+                lm_tokens=False, max_bytes=exact_max_bytes,
+            )
+            lm = exact_crossover_payload_size(
+                palette, subpatch, NSYM, _base64_token_estimate,
+                lm_tokens=True, max_bytes=exact_max_bytes,
+            )
+            lines.append(
+                f"- palette={palette}: "
+                f"{_describe_exact_crossover(per_patch, 'per-patch')}; "
+                f"{_describe_exact_crossover(lm, 'LM-token (UNVERIFIED, see caveat above)')}"
+            )
+            if subpatch == 1 and per_patch.crossing_bytes is not None:
+                subpatch1_crossings.append((palette, per_patch.crossing_bytes))
         lines.append("")
 
     lines += ["### Token-crossover verdict", ""]
     if subpatch1_crossings:
-        parts = [f"palette={p} at ~{c:.0f}B" for p, c in sorted(subpatch1_crossings)]
+        parts = [f"palette={p} at {c}B (exact)" for p, c in sorted(subpatch1_crossings)]
         lines.append(
             "At `subpatch=1` (the only VLM-meaningful regime), the following palette(s) cross "
-            "below base64 token count within the swept payload range: " + ", ".join(parts) + ". "
+            "below base64 token count, PER-PATCH accounting, within the exact scanned range: "
+            + ", ".join(parts) + ". "
             "This is the project's actual, currently-measured benefit claim: for a large "
             "enough payload, encoding it as a heliogram grid costs fewer total patches than "
             "base64-ing it into text tokens, and (per Bar A in the Headline section) does so "
@@ -718,13 +1008,16 @@ def _token_crossover_section(
             "in the Headline section above: the pixel decoder cannot currently realize this "
             "benefit end to end under `jpeg_q70` at these same palettes. The open question is "
             "purely whether a fine-tuned VLM reader can, which is Phase 2 and is not measured "
-            "here."
+            "here. The LM-token (2x2 merger) accounting above crosses at smaller payload sizes "
+            "still, but carries the additional, separate, UNVERIFIED assumption that a merged "
+            "embedding can be read at 4x the per-patch symbol density -- see that subsection's "
+            "caveat; it is not folded into this verdict."
         )
     else:
         lines.append(
-            "No `subpatch=1` (VLM-meaningful) palette crosses below base64 token count "
-            f"anywhere in the swept payload range (up to {max(payload_sizes_present)}B) in "
-            "this run."
+            "No `subpatch=1` (VLM-meaningful) palette crosses below base64 token count, "
+            f"per-patch accounting, anywhere in the exact scanned range (up to "
+            f"{exact_max_bytes}B) in this run."
         )
     lines.append("")
     return lines
@@ -735,7 +1028,7 @@ def write_results_md(
     path: Path,
     stress_results: Optional[List[CellResult]] = None,
 ) -> None:
-    baseline = base64_bits_per_token()
+    baseline = _resolve_base64_baseline()
     sample_payload = _random_payload(0, PAYLOAD_SIZE)
     rendered = rendered_text_density(sample_payload, patch_size=PATCH_SIZE)
     summary = _summary_rows(results)
@@ -759,6 +1052,8 @@ def write_results_md(
 
     lines = [
         "# heliogram v0.1 -- CPU eval results",
+        "",
+        f"**Provenance:** {_provenance_line()}",
         "",
         f"Synthetic, seed-deterministic payloads. Capacity sweep: palette in "
         f"{list(palettes_present)}, subpatch (k) in {list(subpatches_present)}, payload_size "
@@ -793,9 +1088,9 @@ def write_results_md(
         f"- **Bar A -- beat base64 density, clean ({BASE64_BITS_PER_TOKEN:.1f} bits/patch):** "
         "the real economic break-even for bits/patch alone (see Baselines below) -- the "
         "minimum for heliogram to be worth considering purely on density. Evaluated CLEAN "
-        "only in the table below (see the 'beats 6 clean?' column); a config beating Bar A "
-        "clean may or may not survive corruption -- the worst-corruption columns in the same "
-        "row show that separately, and it is not folded into this bar.",
+        f"only in the table below (see the 'beats {BASE64_BITS_PER_TOKEN:.0f} clean?' column); "
+        "a config beating Bar A clean may or may not survive corruption -- the worst-corruption "
+        "columns in the same row show that separately, and it is not folded into this bar.",
         f"- **Bar B -- Gate #1 comfort margin ({GATE_BITS_PER_PATCH:.1f} bits/patch, clean AND "
         "worst-tested-corruption):** deliberately set above Bar A as a robustness margin "
         "before this project starts Phase 2 (see the README's Decision Gate). A config \"clears "
@@ -914,11 +1209,29 @@ def write_results_md(
             "the list above and the \"Token crossover\" section below."
         )
 
+    baseline_tokenizer_id = getattr(baseline, "tokenizer_id", None)
+    baseline_source = (
+        f"MEASURED baseline, tokenizer_id=`{baseline_tokenizer_id}`"
+        if baseline_tokenizer_id is not None
+        else "ANALYTIC assumption (no measured-tokenizer baseline file found in this run -- "
+        "see `heliogram.baselines.load_measured_baseline`)"
+    )
     lines += [
         "",
         "## Baselines",
         "",
-        f"- **base64 in text context:** ~{baseline.bits_per_token:.1f} bits/token ({baseline.note})",
+        f"- **base64 in text context:** ~{baseline.bits_per_token:.1f} bits/token ({baseline.note}). "
+        f"Source: {baseline_source} (see `_resolve_base64_baseline`). **Every Bar A "
+        "('beats base64 clean?') verdict in the Headline table above and every "
+        "`GATE_BITS_PER_PATCH`/`BASE64_BITS_PER_TOKEN` comparison anywhere in this file is "
+        "computed directly against THIS number.** Bar C's `token_ratio`/`heliogram_cheaper` "
+        "in the \"Token crossover\" section below is DIFFERENT: it is computed from a separate, "
+        "fixed closed-form estimate (`base64_token_est = ceil(payload/3)*4`, an implicit "
+        "~1-base64-char/token assumption) that does **not** currently update from this resolved "
+        "baseline even when a measured one is available -- so if the source above is ANALYTIC, "
+        "both Bar A and Bar C rest on the same 6-bits/token assumption; if it is MEASURED, only "
+        "Bar A reflects the measurement and Bar C still rests on the analytic ~1-char/token "
+        "estimate. This asymmetry is a known limitation, not an oversight papered over here.",
         f"- **Rendered text (geometric, model-free):** {rendered.chars_per_patch:.2f} "
         f"chars/patch = {rendered.bits_per_patch:.2f} bits/patch typesetting a "
         f"{PAYLOAD_SIZE}-byte payload (base64'd, {rendered.text_len} chars) into "
@@ -988,10 +1301,12 @@ def write_results_md(
         "## Self-consistency checks",
         "",
         "Three invariants must hold if these numbers mean what they claim to mean: (1) "
-        "bits/patch can never exceed `subpatch²·log2(palette)` -- the raw per-DATA-PATCH "
-        "density for a subpatch x subpatch grid of symbols per patch, before calibration-row "
-        "and Reed-Solomon overhead are subtracted (this generalizes the pre-Slice-B "
-        "`<= log2(palette)` check, which is the `subpatch=1` case where `subpatch²=1`); (2) "
+        "bits/patch (`payload_bytes*8/total_patches`, the TRUE PAYLOAD DENSITY -- see "
+        "`_bits_per_patch_on_success`'s docstring) can never exceed `subpatch²·log2(palette)`, "
+        "the raw per-DATA-PATCH channel CAPACITY for a subpatch x subpatch grid of symbols per "
+        "patch, before calibration-row overhead, Reed-Solomon parity, and grid/bit padding are "
+        "all accounted for (this generalizes the pre-Slice-B `<= log2(palette)` check, which is "
+        "the `subpatch=1` case where `subpatch²=1`); (2) "
         "mean corrupted bits/patch can never exceed clean bits/patch for the same (palette, "
         "subpatch, payload_size), since corruption only ever removes information relative to "
         "the uncorrupted image; (3) [token crossover] every row's `base64_token_est` must "
@@ -1173,38 +1488,39 @@ def main(argv=None) -> int:
     )
 
     crossover_rows = _token_crossover_rows(sweep_results)
-    by_palette_subpatch1: Dict[int, List[Tuple[int, float]]] = {}
-    for row in crossover_rows:
-        if row["subpatch"] == 1:
-            by_palette_subpatch1.setdefault(row["palette"], []).append(
-                (row["payload_size"], row["token_ratio"])
-            )
+    palettes_at_subpatch1 = sorted({row["palette"] for row in crossover_rows if row["subpatch"] == 1})
     print(
         "\nToken crossover, subpatch=1 (VLM-meaningful): total_patches vs base64_token_est "
-        "(~1 token/patch, ~1 token/char) -- THE benefit claim, see RESULTS.md's \"Token "
-        "crossover\" section for the full table incl. subpatch>1 and jpeg_q70 decode success:"
+        "(~1 token/patch, ~1 token/char) -- THE benefit claim, exact byte-granular crossing "
+        "(see exact_crossover_payload_size), not interpolated between swept sample points. See "
+        "RESULTS.md's \"Token crossover\" section for the full table incl. subpatch>1, the "
+        "LM-token (2x2 merger) accounting, and jpeg_q70 decode success:"
     )
-    for palette in sorted(by_palette_subpatch1):
-        pairs = sorted(by_palette_subpatch1[palette])
-        sizes = [p for p, _ in pairs]
-        ratios = [r for _, r in pairs]
-        crossing = _crossover_payload_size(sizes, ratios)
-        if crossing is not None:
+    for palette in palettes_at_subpatch1:
+        result = exact_crossover_payload_size(palette, 1, NSYM, _base64_token_estimate)
+        if result.crossing_bytes is not None:
+            wobble = (
+                f" -- WOBBLES, recrosses at {result.recrossing_bytes[0]}B, see RESULTS.md"
+                if result.recrossing_bytes
+                else ""
+            )
             print(
-                f"  palette={palette}: crosses ~{crossing:.0f}B (token-cheaper than base64 "
-                "from there on, within this sweep's payload range)"
+                f"  palette={palette}: crosses at {result.crossing_bytes}B (exact, "
+                f"token-cheaper than base64 from there on within the scanned range){wobble}"
             )
         else:
-            min_idx = ratios.index(min(ratios))
             print(
-                f"  palette={palette}: no crossover in tested range up to {max(sizes)}B "
-                f"(lowest token_ratio observed: {ratios[min_idx]:.3f} at {sizes[min_idx]}B)"
+                f"  palette={palette}: no crossover found in the exact scan up to "
+                f"{result.max_bytes_scanned}B (lowest token_ratio observed: "
+                f"{result.lowest_ratio:.3f} at {result.lowest_ratio_bytes}B)"
             )
     print(
         "MANDATORY: token-cheaper is NOT the same as decodable -- see RESULTS.md's Token "
         "crossover section for the same cells' jpeg_q70 decode_success_rate shown side by "
         "side (palette=128/256 are measured to FAIL there even where they are token-cheaper "
-        "clean)."
+        "clean). The LM-token (2x2 merger) accounting in RESULTS.md crosses at smaller payload "
+        "sizes still but carries its own additional UNVERIFIED assumption -- see that "
+        "subsection's caveat, not printed here."
     )
 
     stress_results = run(corruptions=STRESS_CORRUPTIONS)
