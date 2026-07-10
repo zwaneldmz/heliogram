@@ -246,6 +246,52 @@ values and nearest-neighbor classify every data patch. The reference decoder
 what it measures is the channel, not decoder cleverness. Full spec:
 [`spec/format-v0.1.md`](spec/format-v0.1.md).
 
+## Instruments (gate-independent)
+
+The codec's headline number is conditional on Decision Gate #1; these instruments are not.
+They are useful whether or not heliogram beats base64, and (except where a real VLM is
+required, which is flagged) they run on CPU here. Each measures **the channel / the reference
+pixel decoder, not a VLM** — the same scope caveat as the rest of Phase 1. Model-requiring
+paths **raise** without a real model rather than fabricate a number (mirroring
+`heliogram.vlm`); nothing below invents a model result.
+
+- **`heliogram.patchsize`** — makes `codec.PATCH_SIZE` (14) *auditable* against a real model
+  instead of a remembered constant. `known_patch_size("Qwen/Qwen2.5-VL-7B-Instruct")` returns
+  the documented ViT patch size; `verify_patch_size(processor=...)` reads it empirically off a
+  real processor/config when you have one (source `"measured"`), else reports the documented
+  value (`"documented"`) and says so. Never fabricates a "measured" number without a real
+  object. CLI: `python3 -m heliogram.patchsize --model Qwen/Qwen2.5-VL-7B-Instruct`.
+- **`heliogram.instruments.foreign_tile`** — a lightweight, model-free **pre-ingest guard**
+  (build the detector *before* any capability work). `guard(img, allowlist)` flags an image
+  carrying a heliogram-like payload that is **not** on a trusted allow-list: natural images
+  (high within-patch variance) pass; patch-structured tiles that no allow-listed
+  `(palette, subpatch)` decodes are flagged. `evaluate_detector(...)` reports TPR at a bounded
+  FPR, with learned-alphabet-style tiles (data cells repainted through a permuted palette, so
+  they defeat `decode_pixels`' calibration-from-row-0 recovery) as the hard positives.
+- **`heliogram.instruments.saliency`** — recoverable bits by patch **position**: a per-grid-
+  position symbol-error map over the corruption suite (`position_error_map(...)`). Model-free
+  byproduct of the sweep. (Honest finding baked into the tests: `crop_pad` on this codec is a
+  *cliff*, not a gradient, at `subpatch=1` — the measurable position effect lives at
+  `subpatch=2`, where calibration and data cross their misalignment thresholds at different
+  shifts. See the module docstring.)
+- **`heliogram.instruments.fingerprint`** — a per-corruption symbol-error **signature** of an
+  encode/decode config; `detect_swap(reference, observed)` flags a silently-swapped
+  encoder/decoder in a blind test (demonstrated against `swapped_palette_encode`). Model-free.
+- **`heliogram.instruments.injection_bench`** — the harness pointed at **behavioral** payloads
+  (persona / schema / tool-call), with a **versioned submission format**
+  (`RESULTS_FORMAT_VERSION`, `write_results`/`read_results`). The behavioral-capacity
+  measurement (`measure_behavioral_capacity`) **requires a real model and raises without one**.
+  The **detector-evaluation mode** (`evaluate_defense`) is CPU and runs here — e.g. scoring
+  `foreign_tile.guard` as a candidate defense (TPR/FPR over injection vs. benign tiles).
+- **`heliogram.instruments.learned_alphabet`** + **`heliogram.encoder`** — a CPU, model-free
+  palette optimizer (`optimize_palette` / `compare_to_handcrafted`) that searches for colors
+  minimizing symbol error under corruption and reports the learned code's error **beside** the
+  handcrafted `get_palette(P)` baseline. **This optimizes against the pixel decoder, not a VLM
+  encoder** — the same "channel measurement, not a capability claim" caveat as `subpatch>1`.
+  The true frozen-encoder-gradient version (optimize *pixels* against a real ViT with input-
+  pixel gradients) is the lazy-GPU scaffold `heliogram.encoder.FrozenEncoderHandle`, which
+  raises without a GPU model and has not been run here.
+
 ## Roadmap / Phase-2 boundary
 
 Phase 1 (this repo) is entirely model-free: codec, corruption suite, harness,

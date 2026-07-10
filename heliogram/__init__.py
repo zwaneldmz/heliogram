@@ -47,6 +47,21 @@ from .dataset import (
     target_to_symbols,
     write_dataset,
 )
+# Gate-independent instruments (the durable value -- see README "Instruments") and the
+# patch-size verifier (makes codec.PATCH_SIZE auditable against a real model config). All of
+# these keep torch/transformers lazy exactly like heliogram.vlm, so importing them here does
+# NOT break the "import heliogram never pulls in torch" invariant -- FrozenEncoderHandle's
+# torch use is local to its methods, and heliogram.instruments' model paths raise without a
+# real model rather than importing one. The `instruments` subpackage is re-exported so
+# `import heliogram; heliogram.instruments.foreign_tile.guard(...)` resolves.
+from . import instruments
+from .encoder import FrozenEncoderHandle
+from .patchsize import (
+    KNOWN_PATCH_SIZES,
+    PatchSizeReport,
+    known_patch_size,
+    verify_patch_size,
+)
 
 try:
     # heliogram.vlm's own top-level imports are as light as heliogram.codec's (no
@@ -77,6 +92,12 @@ __all__ = [
     "write_dataset",
     "QwenVLDecoder",
     "zero_shot_symbol_error",
+    "instruments",
+    "FrozenEncoderHandle",
+    "KNOWN_PATCH_SIZES",
+    "PatchSizeReport",
+    "known_patch_size",
+    "verify_patch_size",
 ]
 
 __version__ = "0.1.0"
