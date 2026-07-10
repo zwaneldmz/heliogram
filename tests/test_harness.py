@@ -13,10 +13,20 @@ Everything below runs `heliogram.harness.run()`/`decode_pixels` (the model-free 
 decoder) at a deliberately tiny (palette, subpatch, payload_size, corruption) grid so it stays
 fast -- nothing here is a VLM/Phase-2 result; see heliogram/codec.py's module docstring and
 RESULTS.md's "Scope" note for the same data-honesty boundary this file respects.
+
+Review-fix (round 2): `_token_crossover` (and its helpers `_grid_stats`/`_base64_token_estimate`/
+`_crossover_payload_size`) is THE benefit metric this project's headline README/RESULTS.md
+claims rest on (see harness.py's module docstring), but had zero unit tests against hand-computed
+values before the "token crossover" section below -- a regression in any of those functions'
+arithmetic (e.g. an off-by-one in `_grid_stats`' `data_patches_needed` ceil, a flipped comparison
+in `_crossover_payload_size`'s interpolation, or `_run_cell` wiring `total_patches`/`token_ratio`
+into the wrong `CellResult` field) would have silently changed the reported token-crossover
+numbers with no test failing. That section closes it.
 """
 
 from __future__ import annotations
 
+import base64
 import math
 
 import pytest
@@ -68,6 +78,139 @@ def test_bits_per_patch_on_success_subpatch2_scales_by_cells_per_patch():
     expected = cells_per_patch * bps * (data_patches / total_patches) * (payload_len / ecc_len)
 
     assert got == pytest.approx(expected)
+
+
+# --- _grid_stats / _token_crossover: THE benefit metric, independently hand-computed ----------
+#
+# Review-fix: before this section, nothing in the test suite asserted total_patches/
+# base64_token_est/token_ratio/heliogram_cheaper (on CellResult or via _token_crossover/
+# _grid_stats directly) against any independently-derived number -- see this file's module
+# docstring. Every expected value below is computed from first principles using the SAME
+# primitives _bits_per_patch_on_success's tests above already use (bits_per_symbol,
+# rs_encoded_length, compute_grid) plus Python's own `base64` module for the token side, never by
+# calling `_grid_stats`/`_token_crossover` and comparing the result to itself.
+
+
+def _manual_grid_stats(payload_len: int, palette: int, nsym: int, subpatch: int = 1):
+    """Independent re-derivation of encode()'s grid math -- mirrors harness._grid_stats'
+    docstring exactly, but written fresh here rather than imported, so a bug introduced into
+    _grid_stats itself has an independent computation to be caught against."""
+    bps = bits_per_symbol(palette)
+    ecc_len = rs_encoded_length(5 + payload_len, nsym)
+    num_symbols = math.ceil(ecc_len * 8 / bps)
+    cells_per_patch = subpatch * subpatch
+    data_patches_needed = math.ceil(num_symbols / cells_per_patch)
+    width, height = compute_grid(data_patches_needed, palette)
+    total_patches = width * height
+    data_patches = width * (height - 1)
+    return total_patches, data_patches
+
+
+@pytest.mark.parametrize(
+    "payload_len,palette,nsym,subpatch",
+    [
+        (48, 8, 32, 1),
+        (1024, 256, 32, 1),
+        (4096, 256, 32, 1),
+        (48, 8, 32, 2),
+    ],
+)
+def test_grid_stats_matches_independent_recomputation(payload_len, palette, nsym, subpatch):
+    """_grid_stats' total_patches/data_patches (the geometry both bits/patch AND token-crossover
+    are built on) must match a hand-rederived grid size, not just be internally consistent with
+    itself."""
+    g = harness._grid_stats(payload_len, palette, nsym, subpatch)
+    expected_total, expected_data = _manual_grid_stats(payload_len, palette, nsym, subpatch)
+    assert g.total_patches == expected_total
+    assert g.data_patches == expected_data
+
+
+def test_base64_token_estimate_matches_standard_formula_and_real_base64():
+    """_base64_token_estimate must equal ceil(n/3)*4 -- the standard base64-with-padding
+    expansion -- AND match Python's own base64.b64encode length for real payloads, not just an
+    internally-consistent restatement of the same ceil formula."""
+    for n in (0, 1, 2, 3, 4, 5, 6, 48, 1024, 4096, 16384):
+        got = harness._base64_token_estimate(n)
+        assert got == math.ceil(n / 3) * 4
+        assert got == len(base64.b64encode(bytes(n)))
+
+
+# Hand-computed (palette, subpatch, payload_len, nsym) -> (total_patches, base64_token_est,
+# token_ratio, heliogram_cheaper), independently re-derived via _manual_grid_stats/base64 above
+# and cross-checked against results.csv's own stored rows for the same cells where present (see
+# each case's comment). Deliberately includes one case on each side of the 1.0 crossover
+# (palette=256 at 1024B is NOT cheaper; at 4096B it IS) so the boolean flag is exercised both
+# ways, not just checked for "some value".
+_TOKEN_CROSSOVER_CASES = [
+    # matches results.csv: palette=8,subpatch=1,payload_size=48,corruption=clean
+    (48, 8, 32, 1, 256, 64, 4.0, False),
+    # matches results.csv: palette=256,subpatch=1,payload_size=1024 (any corruption -- token
+    # fields don't vary by corruption, see CellResult's docstring)
+    (1024, 256, 32, 1, 1536, 1368, 1536 / 1368, False),
+    # matches results.csv: palette=256,subpatch=1,payload_size=4096 -- the crossover case
+    (4096, 256, 32, 1, 5120, 5464, 5120 / 5464, True),
+    # matches results.csv: palette=8,subpatch=2,payload_size=48
+    (48, 8, 32, 2, 72, 64, 72 / 64, False),
+]
+
+
+@pytest.mark.parametrize(
+    "payload_len,palette,nsym,subpatch,exp_total,exp_b64,exp_ratio,exp_cheaper",
+    _TOKEN_CROSSOVER_CASES,
+)
+def test_token_crossover_matches_hand_computed_values(
+    payload_len, palette, nsym, subpatch, exp_total, exp_b64, exp_ratio, exp_cheaper
+):
+    """The regression guard this review round flags as entirely missing (see this file's module
+    docstring): pins _token_crossover's output against hand-computed total_patches/
+    base64_token_est/token_ratio/heliogram_cheaper for concrete (payload_len, palette, nsym,
+    subpatch) tuples that also match results.csv's own stored rows for the same cells (see each
+    case's comment above) -- so a future change to the data_patches_needed ceil, the base64
+    formula, or the ratio/threshold computation would be caught here even if results.csv were
+    never regenerated."""
+    tc = harness._token_crossover(payload_len, palette, nsym, subpatch)
+    assert tc.total_patches == exp_total
+    assert tc.base64_token_est == exp_b64
+    assert tc.token_ratio == pytest.approx(exp_ratio)
+    assert tc.heliogram_cheaper is exp_cheaper
+    assert tc.heliogram_cheaper == (tc.token_ratio < 1.0)  # the flag IS the threshold, nothing else
+
+
+def test_crossover_payload_size_interpolates_linearly_hand_computed():
+    """_crossover_payload_size's three branches, each hand-verified independently of the
+    function: (1) linear interpolation between two swept sizes when the ratio crosses 1.0
+    between them -- r0=1.2 at 100B, r1=0.8 at 200B, frac=(1.2-1.0)/(1.2-0.8)=0.5, so the crossing
+    is 100 + 0.5*(200-100) = 150.0 exactly; (2) already cheaper at the smallest swept size
+    returns that size unchanged; (3) a ratio that never drops below 1.0 anywhere in the swept
+    range returns None (NOT a claim it never crosses at some larger, untested size -- see the
+    function's own docstring)."""
+    assert harness._crossover_payload_size([100, 200, 300], [1.2, 0.8, 0.5]) == pytest.approx(150.0)
+    assert harness._crossover_payload_size([100, 200, 300], [0.9, 0.8, 0.5]) == 100.0
+    assert harness._crossover_payload_size([100, 200, 300], [2.0, 1.5, 1.2]) is None
+    assert harness._crossover_payload_size([], []) is None
+
+
+def test_run_cell_wires_token_crossover_fields_onto_cell_result():
+    """Guards the WIRING, not just the pure function: _run_cell must actually copy
+    _token_crossover's output onto the CellResult it returns (total_patches/base64_token_est/
+    token_ratio/heliogram_cheaper), not just compute it and drop it -- a real (tiny) run through
+    _run_cell, checked against the same hand-computed values test_token_crossover_matches_
+    hand_computed_values pins for the pure function, plus results.csv's own stored row for this
+    exact cell (palette=256, subpatch=1, payload_size=4096, corruption=clean:
+    total_patches=5120, base64_token_est=5464, token_ratio=0.937042...)."""
+    result = harness._run_cell(
+        palette=256,
+        corruption_name="clean",
+        corruption_fn=harness.CORRUPTIONS["clean"],
+        n_trials=1,
+        payload_size=4096,
+        subpatch=1,
+    )
+    assert result.total_patches == 5120
+    assert result.base64_token_est == 5464
+    assert result.token_ratio == pytest.approx(5120 / 5464)
+    assert result.heliogram_cheaper is True
+    assert result.decode_success_rate == 1.0  # clean corruption must always succeed
 
 
 # --- _gate_rows: the ceiling formula Finding #3 specifically flags as untested ----------------

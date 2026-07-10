@@ -15,7 +15,7 @@ default below). Multi-GPU or more VRAM lets you raise --batch-size/--grad-accum-
 script relies entirely on `transformers.Trainer` + `accelerate` for any parallelism, it does not
 implement its own.
 
-What this does (the curriculum from the Phase-2 handover):
+What this does (the curriculum from the Phase-2 handover, retargeted -- Slice C):
   1. Generate synthetic heliogram images + target symbol strings via heliogram.dataset (see
      scripts/gen_dataset.py) for each curriculum stage -- CPU-only, no GPU needed for this part,
      and every target is exact ground truth from the codec itself (no hand labeling anywhere).
@@ -23,14 +23,32 @@ What this does (the curriculum from the Phase-2 handover):
      adapters (peft) on the attention projections (q_proj/k_proj/v_proj/o_proj) and MLP
      projections (gate_proj/up_proj/down_proj) of the language-model decoder stack.
   3. Fine-tune across a CURRICULUM of increasing difficulty (see build_curriculum() below):
-     stage 1 is the lowest-density, cleanest regime (small palette, subpatch=1 -- one symbol
-     per patch, no corruption augmentation); later stages widen the palette and turn on
-     corruption augmentation (heliogram.dataset's DEFAULT_CORRUPTIONS, mirroring
-     heliogram.harness's realistic envelope). Each stage runs a normal Trainer.train() call and
-     continues from the previous stage's adapter weights.
+     stage 1 is a cheap, low-density warm-up (small palette, subpatch=1, no corruption); every
+     stage after that concentrates specifically on `palette` in `{64, 128, 256}` at
+     `subpatch=1` -- the exact (palette, subpatch) regime `heliogram.codec`/RESULTS.md MEASURE
+     `decode_pixels` to clean-decode exactly but FAIL under JPEG q70 (and, at larger payloads,
+     JPEG q85) -- with corruption augmentation (heliogram.dataset's DEFAULT_CORRUPTIONS,
+     mirroring heliogram.harness's realistic envelope) turned on and increasingly concentrated
+     on those same failure-inducing corruptions in the final stage. Each stage runs a normal
+     Trainer.train() call and continues from the previous stage's adapter weights.
   4. Save the resulting LoRA adapter (not a full model merge -- get_peft_model()'s
      save_pretrained() saves adapter weights only) to --output-dir, once per stage and once
      more as "final".
+
+THE BET this curriculum trains toward (see heliogram/dataset.py's module docstring for the full
+argument): learned classification of a BIG COLOR PALETTE through realistic corruption, NOT
+sub-patch geometry. `subpatch` is pinned to 1 in every stage below (see build_curriculum()'s own
+docstring) -- `subpatch>1` remains a separate, documented, PIXEL-DECODER-ONLY geometric ceiling
+(heliogram/codec.py's DATA HONESTY note, spec/format-v0.1.md section 6a) with no evidence a real
+ViT patch embedding can resolve structure smaller than its own patch. A patch's dominant color,
+by contrast, is a coarse whole-patch feature a patch embedding could plausibly encode even
+through JPEG/resize blur -- untested, which is exactly what this training run and the
+before/after measurement it enables (heliogram.vlm.zero_shot_symbol_error on the stock model,
+then the same metric on the fine-tuned checkpoint) are for. Succeeding at this is what would
+make the README's Bar C (token crossover: fewer total patches than base64 tokens, from ~3-13KB
+payloads at palette=128/256) usable end to end instead of a clean-channel-only accounting fact
+-- see RESULTS.md's "Token crossover" section for the exact numbers this curriculum is trying to
+make real. Nothing in this file measures whether that succeeds; only a real GPU run can.
 
 This is a MINIMAL starting recipe: hyperparameters below (LoRA rank/alpha/dropout, learning
 rate, batch size) are standard QLoRA defaults from the literature, not the result of any sweep
@@ -51,16 +69,22 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 # Allow running as `python scripts/train_qlora.py` from anywhere without an editable install --
 # see scripts/gen_dataset.py's identical comment for why this is needed.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from heliogram.codec import PATCH_SIZE, VALID_PALETTES  # noqa: E402 -- no heavy deps
-from heliogram.dataset import iter_manifest, write_dataset  # noqa: E402 -- no heavy deps
+from heliogram.codec import PATCH_SIZE  # noqa: E402 -- no heavy deps
+from heliogram.dataset import (  # noqa: E402 -- no heavy deps
+    DEFAULT_CORRUPTIONS,
+    DEFAULT_PALETTES,
+    RECOMMENDED_TRAINING_CORRUPTION_PROB,
+    iter_manifest,
+    write_dataset,
+)
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
@@ -80,7 +104,19 @@ class CurriculumStage:
     """One stage of the training curriculum: a (palette, subpatch, payload_sizes,
     corruption_prob) regime to generate fresh examples for and train on, continuing from
     whatever adapter weights the previous stage produced. Ordered low-density/clean -> higher-
-    density/corrupted, per the Phase-2 handover's curriculum guidance."""
+    density/corrupted, per the Phase-2 handover's curriculum guidance, retargeted (Slice C) to
+    concentrate later stages on the large-palette-under-corruption bet (see module docstring).
+
+    `corruptions` (optional) overrides the corruption suite `write_dataset` draws from for this
+    stage only (default `None` -- falls back to `heliogram.dataset.DEFAULT_CORRUPTIONS`, the
+    full realistic-envelope suite). A stage that wants to concentrate specifically on the
+    corruptions RESULTS.md pins as this palette range's actual measured failure points (rather
+    than spreading its corruption budget uniformly across the whole realistic-envelope suite)
+    passes a narrower dict here -- see stage4 in build_curriculum() below. Any custom dict here
+    must still include a "clean" entry whenever this stage's `corruption_prob < 1.0` (see
+    heliogram.dataset.generate_examples' contract: "clean" is looked up unconditionally for the
+    "no corruption fired" branch).
+    """
 
     name: str
     n_examples: int
@@ -89,21 +125,43 @@ class CurriculumStage:
     payload_sizes: Sequence[int]
     corruption_prob: float
     epochs: int
+    corruptions: Optional[Dict[str, Callable]] = field(default=None)
+
+
+# The specific corruptions RESULTS.md pins as this palette range's actual measured failure
+# points (see heliogram/codec.py's DATA HONESTY note and RESULTS.md's Headline/Token-crossover
+# sections): palette=128/256 FAIL jpeg_q70 at every tested payload size, and jpeg_q85 too at
+# larger payloads; "combined" (resize + JPEG q70 + crop/pad composed) is the harness's own
+# worst-tested corruption. "clean" stays included -- see CurriculumStage's docstring: a custom
+# `corruptions` dict is looked up for the "no corruption fired" case too whenever
+# corruption_prob < 1.0, so even a "hard focus" stage that is mostly (not always) corrupted
+# needs a "clean" entry.
+_HARD_CORRUPTION_NAMES = {"clean", "jpeg_q70", "jpeg_q85", "combined"}
 
 
 def build_curriculum(n_examples_per_stage: int = 2000) -> List[CurriculumStage]:
-    """Default curriculum: low density (small palette, subpatch=1 -- one symbol/patch, no
-    corruption) first, then widen the palette, then turn on corruption augmentation.
+    """Default curriculum (Slice C retarget): a cheap warm-up, then three stages that
+    concentrate on `DEFAULT_PALETTES` (`{64, 128, 256}` -- see heliogram/dataset.py's module
+    docstring for why) at `subpatch=1`, clean first and then increasingly corrupted, finishing
+    with a stage that up-weights the SPECIFIC corruptions (`jpeg_q70`/`jpeg_q85`/`combined`)
+    RESULTS.md measures this palette range to actually fail under -- rather than spreading a
+    generic corruption budget uniformly across the whole realistic-envelope suite for the whole
+    run. See the module docstring's "THE BET" paragraph for why this is the retargeted goal.
 
     `subpatch` is pinned to 1 in every stage below: subpatch>1 is a pixel-decoder-only
     geometric ceiling with no evidence a real ViT encoder can resolve it (see
     heliogram/codec.py's DATA HONESTY note and spec/format-v0.1.md section 6a) -- training a
     VLM to emit subpatch>1 targets is speculative and left to a manually constructed curriculum
     (this function's return value is a plain list; edit it or write your own), not this default.
+
+    Palette/payload/corruption-prob/epoch numbers below are a reasonable-starting-point design,
+    same caveat as everywhere else in this file: not the result of a sweep (no GPU here to sweep
+    on), and not a claim about what actually works -- only a real training + evaluation run can
+    show that.
     """
     return [
         CurriculumStage(
-            name="stage1_low_density_clean",
+            name="stage1_warmup_small_palette_clean",
             n_examples=n_examples_per_stage,
             palettes=[2, 4],
             subpatches=[1],
@@ -112,22 +170,36 @@ def build_curriculum(n_examples_per_stage: int = 2000) -> List[CurriculumStage]:
             epochs=1,
         ),
         CurriculumStage(
-            name="stage2_full_palette_clean",
+            name="stage2_large_palette_clean",
             n_examples=n_examples_per_stage,
-            palettes=list(VALID_PALETTES),
+            palettes=list(DEFAULT_PALETTES),
             subpatches=[1],
-            payload_sizes=[16, 48, 128],
+            payload_sizes=[128, 1024, 4096],
             corruption_prob=0.0,
             epochs=1,
         ),
         CurriculumStage(
-            name="stage3_full_palette_corrupted",
+            name="stage3_large_palette_corrupted",
             n_examples=n_examples_per_stage,
-            palettes=list(VALID_PALETTES),
+            palettes=list(DEFAULT_PALETTES),
             subpatches=[1],
-            payload_sizes=[16, 48, 128],
-            corruption_prob=0.5,
-            epochs=1,
+            payload_sizes=[128, 1024, 4096],
+            corruption_prob=RECOMMENDED_TRAINING_CORRUPTION_PROB,
+            epochs=2,
+        ),
+        CurriculumStage(
+            name="stage4_hard_corruption_focus",
+            n_examples=n_examples_per_stage,
+            palettes=list(DEFAULT_PALETTES),
+            subpatches=[1],
+            payload_sizes=[128, 1024, 4096],
+            corruption_prob=0.9,
+            epochs=2,
+            corruptions={
+                name: fn
+                for name, fn in DEFAULT_CORRUPTIONS.items()
+                if name in _HARD_CORRUPTION_NAMES
+            },
         ),
     ]
 
@@ -240,6 +312,7 @@ def _train_stage(
         nsym=args.nsym,
         seed=args.seed,
         corruption_prob=stage.corruption_prob,
+        corruptions=stage.corruptions,
     )
     dataset = _build_hf_dataset(manifest_path, processor)
 

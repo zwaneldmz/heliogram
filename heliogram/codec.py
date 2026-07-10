@@ -3,11 +3,17 @@
 See spec/format-v0.1.md for the full mini-RFC. This module implements exactly that format:
 
 - PATCH_SIZE px solid-color blocks are the symbol unit (default 14px, ~1 ViT patch/token).
-- Palette size P in {2,4,8,16,32,64}; bits_per_symbol = log2(P). Colors are deterministic: P<=16
-  uses evenly spaced HSV hues at full saturation/value, exactly as in the original v0.1 release
-  (unchanged numbers). P>16 (32, 64) additionally tiles a few VALUE levels over that same
-  16-hue wheel, since hue alone stops being separable at that density -- see get_palette's
-  docstring. Same P always yields the same colors, no RNG.
+- Palette size P in {2,4,8,16,32,64,128,256}; bits_per_symbol = log2(P). Colors are
+  deterministic: P<=16 uses evenly spaced HSV hues at full saturation/value, exactly as in the
+  original v0.1 release (unchanged numbers). P>16 (32, 64, 128, 256) additionally tiles more
+  VALUE levels over that same 16-hue wheel, since hue alone stops being separable at that
+  density -- see get_palette's docstring. Same P always yields the same colors, no RNG.
+  DATA HONESTY: P=128/256 clean-decode exactly on this reference pixel decoder (all colors
+  distinct, nearest-neighbor classification is exact on an uncorrupted image) but are MEASURED
+  to FAIL under realistic JPEG q70 compression on this same decoder -- chroma subsampling erodes
+  hue separation faster than 256-way nearest-neighbor can tolerate. That is a fact about this
+  pixel decoder, not a capability claim about a learned (VLM) reader -- see spec/format-v0.1.md
+  section 2a and tests/test_roundtrip.py's pinned known-failure tests.
 - Row 0 of the patch grid is a CALIBRATION ROW: patch i = palette[i % P]. This lets a decoder
   recover the actual on-image RGB for every palette color after corruption, before classifying
   data patches against those recovered colors (nearest-neighbor). Row 0 is always full patches,
@@ -67,7 +73,7 @@ __all__ = [
 CODEC_VERSION = 1          # format version byte written into every framed message
 PATCH_SIZE = 14            # default patch size in px (~1 ViT patch/token)
 RS_NSIZE = 255             # reedsolo's GF(256) codeword size (its library default/max)
-VALID_PALETTES = (2, 4, 8, 16, 32, 64)
+VALID_PALETTES = (2, 4, 8, 16, 32, 64, 128, 256)
 VALID_SUBPATCHES = (1, 2)  # `subpatch` (k): k x k solid-color sub-cells per data patch
 
 
@@ -102,16 +108,29 @@ def get_palette(palette: int) -> List[Tuple[int, int, int]]:
     S=V=1.0. This is the original v0.1 scheme, byte-for-byte UNCHANGED for P in {2,4,8,16} --
     the reference values pinned in spec/format-v0.1.md stay valid.
 
-    P > 16 (32, 64, the only larger sizes in VALID_PALETTES): hue-only separation runs out at
-    this density -- adjacent hues get close in RGB, and JPEG's chroma subsampling erodes hue
-    (chroma) differences faster than brightness (luma) ones. So colors additionally vary in
+    P > 16 (32, 64, 128, 256 -- the larger sizes in VALID_PALETTES): hue-only separation runs
+    out at this density -- adjacent hues get close in RGB, and JPEG's chroma subsampling erodes
+    hue (chroma) differences faster than brightness (luma) ones. So colors additionally vary in
     VALUE: the palette is `levels` value-levels (`levels = palette // 16`; 2 for P=32, 4 for
-    P=64) of the same 16 hues used by P=16 (hue_i = i / 16), at S=1.0 and value stepped evenly
-    from 1.0 down to a floor of 0.4. This is a DESIGN CHOICE to add a second separation axis
-    riding on luma (which JPEG preserves at full spatial resolution, unlike subsampled chroma)
-    -- it is not empirically validated against corruption in this slice; see
-    spec/format-v0.1.md section 2a. Still fully deterministic: no RNG, same P -> same colors,
-    and all P colors are guaranteed distinct (see tests/test_roundtrip.py).
+    P=64, 8 for P=128, 16 for P=256) of the same 16 hues used by P=16 (hue_i = i / 16), at S=1.0
+    and value stepped evenly from 1.0 down to a floor of 0.4. This is a DESIGN CHOICE to add a
+    second separation axis riding on luma (which JPEG preserves at full spatial resolution,
+    unlike subsampled chroma) -- it is not empirically validated against corruption in this
+    slice; see spec/format-v0.1.md section 2a. Still fully deterministic: no RNG, same P -> same
+    colors, and all P colors are guaranteed distinct (see tests/test_roundtrip.py), including
+    get_palette(256).
+
+    Extending to P=128/256 reused this exact formula unchanged (only `levels` grows to 8/16) --
+    the P<=64 branch and the P>16 branch's code path are untouched, so get_palette(P) for P in
+    {2,4,8,16,32,64} is byte-identical to every prior release
+    (tests/test_roundtrip.py::test_get_palette_le64_byte_identical_to_pinned_values pins this
+    against SHA-256 digests captured from git history, not just a re-derivation of the current
+    code). P=128/256 clean-decode exactly
+    on decode_pixels (see tests/test_roundtrip.py) but are MEASURED to fail under JPEG q70 on
+    this reference pixel decoder -- see the module docstring's DATA HONESTY note and
+    spec/format-v0.1.md section 2a. Nobody has tested whether a learned (VLM) reader could do
+    better; that is exactly the open Phase-2 question, not something this function's determinism
+    settles either way.
     """
     _check_palette(palette)
     if palette <= 16:
@@ -124,7 +143,8 @@ def get_palette(palette: int) -> List[Tuple[int, int, int]]:
 
     # P > 16: tile the same 16-way hue wheel across `levels` value levels so all P colors stay
     # distinct once hue alone runs out of separation. hues=16 keeps the brightest level
-    # (value=1.0) identical to the P=16 hue set; levels = palette // hues (2 for 32, 4 for 64).
+    # (value=1.0) identical to the P=16 hue set; levels = palette // hues (2 for 32, 4 for 64,
+    # 8 for 128, 16 for 256).
     hues = 16
     levels = palette // hues
     v_min = 0.4

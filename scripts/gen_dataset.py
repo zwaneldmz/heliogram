@@ -11,10 +11,19 @@ Every image/target pair this writes is ground truth by construction (heliogram.c
 writes a known symbol grid; heliogram.codec.extract_symbols() reads it back off the clean image
 before any corruption augmentation is applied) -- see heliogram/dataset.py's module docstring.
 
+DEFAULTS (Slice C retarget -- see heliogram/dataset.py's module docstring "THE BET" paragraph):
+`--palettes` now defaults to `DEFAULT_PALETTES` (64, 128, 256 -- where decode_pixels is MEASURED
+to clean-decode exactly but FAIL under JPEG q70/q85, see RESULTS.md), and `--corruption-prob`
+now defaults to `RECOMMENDED_TRAINING_CORRUPTION_PROB` (0.5) instead of 0.0 -- a bare invocation
+with no flags now generates large-palette, corruption-augmented data by default, since that is
+what this project's actual Phase-2 bet needs training data for. Pass `--palettes
+2,4,8,16,32,64,128,256 --corruption-prob 0.0` to reproduce the old "every palette, clean-only"
+default.
+
 Usage:
     python scripts/gen_dataset.py --out data/phase2_train --n 2000 --seed 0
-    python scripts/gen_dataset.py --out data/phase2_val   --n 200  --seed 1 --corruption-prob 0.5
-    python scripts/gen_dataset.py --out data/phase2_small --n 50 --palettes 2,4 --payload-sizes 16
+    python scripts/gen_dataset.py --out data/phase2_val   --n 200  --seed 1
+    python scripts/gen_dataset.py --out data/phase2_small --n 50 --palettes 2,4 --payload-sizes 16 --corruption-prob 0.0
 """
 
 from __future__ import annotations
@@ -30,8 +39,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from heliogram.codec import PATCH_SIZE, VALID_PALETTES, VALID_SUBPATCHES  # noqa: E402
 from heliogram.dataset import (  # noqa: E402
+    DEFAULT_PALETTES,
     DEFAULT_PAYLOAD_SIZES,
     DEFAULT_SUBPATCHES,
+    RECOMMENDED_TRAINING_CORRUPTION_PROB,
     write_dataset,
 )
 
@@ -59,9 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--palettes",
         type=_int_list,
-        default=list(VALID_PALETTES),
+        default=list(DEFAULT_PALETTES),
         help=f"comma-separated palette sizes to sample from, subset of {VALID_PALETTES} "
-        "(default: all)",
+        f"(default: {list(DEFAULT_PALETTES)} -- the large-palette-under-corruption bet, see "
+        "heliogram/dataset.py's module docstring; pass e.g. --palettes "
+        f"{','.join(str(p) for p in VALID_PALETTES)} for the full range)",
     )
     parser.add_argument(
         "--subpatches",
@@ -90,11 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--corruption-prob",
         type=float,
-        default=0.0,
+        default=RECOMMENDED_TRAINING_CORRUPTION_PROB,
         help="probability of applying one randomly chosen corruption (from "
         "heliogram.dataset.DEFAULT_CORRUPTIONS, mirroring heliogram.harness's realistic "
         "envelope) to each example as augmentation; 0.0 disables augmentation entirely "
-        "(default: 0.0)",
+        f"(default: {RECOMMENDED_TRAINING_CORRUPTION_PROB} -- corruption augmentation ON by "
+        "default, since learning to classify a big palette THROUGH corruption is this "
+        "project's retargeted bet, see heliogram/dataset.py's module docstring)",
     )
     parser.add_argument(
         "--image-format",

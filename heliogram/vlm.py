@@ -22,6 +22,16 @@ What's actually implemented vs. what's untested:
 
 See `scripts/train_qlora.py` for how a real `model`/`processor` pair would be produced, and the
 README's "Phase 2 (GPU)" section for the end-to-end flow.
+
+THE BET this decoder exists to test (Slice C retarget -- see `heliogram/dataset.py`'s module
+docstring for the full argument): whether a fine-tuned VLM can classify a BIG color palette
+(`palette` in `{64, 128, 256}`) correctly at `subpatch=1` through the same realistic corruption
+where `heliogram.codec.decode_pixels`'s nearest-neighbor classifier is MEASURED to fail (JPEG
+q70, and at larger payloads JPEG q85 -- see RESULTS.md). That is why `QwenVLDecoder`'s own
+default `palette` below is `256`, not a small palette: this class's whole reason to exist is
+the regime the pixel decoder cannot handle, not the regime it already can. `subpatch` stays 1
+throughout -- sub-patch geometry (`subpatch>1`) is a separate, documented, pixel-decoder-only
+axis this decoder is not aimed at (see `codec.py`'s DATA HONESTY note).
 """
 
 from __future__ import annotations
@@ -143,6 +153,13 @@ class QwenVLDecoder:
     and call time: it only affects the final RS-decode step (after transcription), not the
     prompt or parsing, so callers may freely vary it per call, exactly like `decode_pixels`.
 
+    `palette` defaults to `256` (not `decode_pixels`' small default of `8`) -- see the module
+    docstring's "THE BET" paragraph: this class exists specifically to test the large-palette
+    regime the pixel decoder is measured to fail under corruption, so its own default should
+    point at that regime, not an easy one `decode_pixels` already handles. Always pass the
+    `palette`/`subpatch` your actual fine-tuned checkpoint was trained for, though -- these
+    defaults are a documentation choice, not a substitute for matching your checkpoint.
+
     DATA HONESTY: calling an instance with `model=None` (the default) raises RuntimeError
     pointing at `scripts/train_qlora.py` -- there is no bundled model, and no code path here
     invents a result. See the module docstring for what is/isn't tested.
@@ -152,7 +169,7 @@ class QwenVLDecoder:
         self,
         model: object = None,
         processor: object = None,
-        palette: int = 8,
+        palette: int = 256,
         subpatch: int = 1,
         patch_size: int = PATCH_SIZE,
         nsym: int = 32,
@@ -265,7 +282,7 @@ class QwenVLDecoder:
     def __call__(
         self,
         img: Image.Image,
-        palette: int = 8,
+        palette: int = 256,
         patch_size: int = PATCH_SIZE,
         nsym: int = 32,
         subpatch: int = 1,
@@ -330,10 +347,21 @@ def zero_shot_symbol_error(
 
     `configs` is a sequence of dicts, each with at least a `"palette"` key (subset of
     `heliogram.codec.VALID_PALETTES`) and optionally `"subpatch"`, `"patch_size"`, `"nsym"`,
-    `"payload_size"` (defaults: 1, `PATCH_SIZE`, 32, 48). Returns one `ZeroShotResult` per
+    `"payload_size"` (defaults: 1, `PATCH_SIZE`, 32, 4096). Returns one `ZeroShotResult` per
     config, in the same order, each averaged over `n_trials` random payloads (seeded from
     `seed`, deterministic in the *inputs* generated -- not in the model's output, which is
     outside this function's control).
+
+    Per the Slice C retarget (see `heliogram.dataset`'s module docstring), the recommended
+    `configs` for this project's actual open question are `palette` in `{64, 128, 256}` at a
+    range of payload sizes spanning the low-KB regime (e.g. `[{"palette": p, "payload_size": s}
+    for p in (64, 128, 256) for s in (1024, 4096, 16384)]`) -- mirroring exactly the
+    (palette, payload_size) cells `heliogram.harness`'s own sweep measures `decode_pixels` to
+    clean-decode but fail under JPEG q70/q85 on (see RESULTS.md's "Token crossover" section),
+    so a zero-shot (and later fine-tuned) VLM's numbers land in the same table as the pixel
+    decoder's for a direct before/after comparison. The `payload_size` fallback above (4096,
+    changed from an earlier 48) reflects that same regime, not an arbitrary pick -- 48B is far
+    below where the token-crossover benefit (README's Bar C) shows up at all.
     """
     if model is None or processor is None:
         raise ValueError(
@@ -349,7 +377,7 @@ def zero_shot_symbol_error(
         subpatch = int(cfg.get("subpatch", 1))  # type: ignore[arg-type]
         patch_size = int(cfg.get("patch_size", PATCH_SIZE))  # type: ignore[arg-type]
         nsym = int(cfg.get("nsym", 32))  # type: ignore[arg-type]
-        payload_size = int(cfg.get("payload_size", 48))  # type: ignore[arg-type]
+        payload_size = int(cfg.get("payload_size", 4096))  # type: ignore[arg-type]
 
         decoder = QwenVLDecoder(
             model=model,

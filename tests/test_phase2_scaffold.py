@@ -51,7 +51,6 @@ from heliogram.vlm import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-
 # --- import-time / package boundary -----------------------------------------------------------
 
 
@@ -75,13 +74,21 @@ def test_heliogram_reexports_phase2_names():
 
 
 def test_symbol_alphabet_covers_every_valid_palette():
-    assert len(SYMBOL_ALPHABET) == 64
-    assert len(set(SYMBOL_ALPHABET)) == 64  # all distinct
-    assert max(VALID_PALETTES) <= len(SYMBOL_ALPHABET)
+    """SYMBOL_ALPHABET must have one distinct character per symbol value for the LARGEST palette
+    in VALID_PALETTES (256), so every palette is fully representable. If VALID_PALETTES grows
+    past 256 without SYMBOL_ALPHABET keeping up, this fails -- exactly the drift it exists to
+    catch. The first 64 characters stay the base64 alphabet for backward compatibility with any
+    manifest.jsonl target string written before the palette range grew past 64."""
+    assert len(SYMBOL_ALPHABET) == 256
+    assert len(set(SYMBOL_ALPHABET)) == 256  # all distinct (target_to_symbols' lookup needs it)
+    assert max(VALID_PALETTES) <= len(SYMBOL_ALPHABET)  # every palette fully representable
+    # whitespace-safe: _extract_symbol_string strips whitespace via str.split(), so a whitespace
+    # alphabet char would be silently dropped -- none may be whitespace.
+    assert not any(ch.isspace() for ch in SYMBOL_ALPHABET)
 
 
 def test_symbols_to_target_roundtrip():
-    for palette in VALID_PALETTES:
+    for palette in VALID_PALETTES:  # every palette, including 128/256, is now representable
         symbols = list(range(palette)) * 3  # exercise every symbol value at least 3x
         target = symbols_to_target(symbols, palette)
         assert len(target) == len(symbols)
@@ -161,12 +168,16 @@ def test_generate_examples_ground_truth_matches_codec_clean_roundtrip():
 
 
 def test_generate_examples_corruption_prob_zero_is_always_clean():
-    examples = list(generate_examples(10, payload_sizes=(16,), seed=3, corruption_prob=0.0))
+    examples = list(generate_examples(
+        10, palettes=VALID_PALETTES, payload_sizes=(16,), seed=3, corruption_prob=0.0
+    ))
     assert all(ex.corruption == "clean" for ex in examples)
 
 
 def test_generate_examples_corruption_prob_one_is_never_clean():
-    examples = list(generate_examples(10, payload_sizes=(16,), seed=3, corruption_prob=1.0))
+    examples = list(generate_examples(
+        10, palettes=VALID_PALETTES, payload_sizes=(16,), seed=3, corruption_prob=1.0
+    ))
     assert all(ex.corruption != "clean" for ex in examples)
     assert all(ex.corruption in DEFAULT_CORRUPTIONS for ex in examples)
 
@@ -174,7 +185,9 @@ def test_generate_examples_corruption_prob_one_is_never_clean():
 def test_generate_examples_target_survives_corruption():
     """Even when the returned image IS corrupted, `target` still matches the clean encode of
     the same payload -- ground truth is never re-derived from the (possibly corrupted) image."""
-    for ex in generate_examples(6, payload_sizes=(48,), seed=5, corruption_prob=1.0):
+    for ex in generate_examples(
+        6, palettes=VALID_PALETTES, payload_sizes=(48,), seed=5, corruption_prob=1.0
+    ):
         clean_img = encode(
             ex.payload,
             palette=ex.palette,
@@ -248,7 +261,9 @@ def test_write_dataset_matches_generate_examples(tmp_path):
 
 
 def test_iter_manifest_resolves_paths_relative_to_manifest_dir(tmp_path):
-    manifest_path = write_dataset(tmp_path / "ds3", 2, payload_sizes=(16,), seed=4)
+    manifest_path = write_dataset(
+        tmp_path / "ds3", 2, palettes=VALID_PALETTES, payload_sizes=(16,), seed=4
+    )
     for record in iter_manifest(manifest_path):
         assert Path(record["image_path"]).is_absolute()
         assert Path(record["image_path"]).exists()
@@ -293,17 +308,22 @@ def test_payload_from_symbols_raises_heliogram_decode_error_on_garbage():
         _payload_from_symbols([0, 1, 2], palette=8, nsym=32)  # far too short to be a real frame
 
 
-def test_qwen_vl_decoder_full_pipeline_without_a_model():
+@pytest.mark.parametrize("palette", [8, 128, 256])
+def test_qwen_vl_decoder_full_pipeline_without_a_model(palette):
     """End-to-end proof that QwenVLDecoder's non-model plumbing (prompt -> [pretend the model
     echoed the target perfectly] -> parse -> RS/framing) reconstructs the original payload,
-    without ever touching _generate/torch."""
-    palette = 8
+    without ever touching _generate/torch. Includes palette=128/256 to exercise the extended
+    SYMBOL_ALPHABET end to end (prompt's alphabet slice + target<->symbol round trip)."""
     payload = b"end-to-end parse+framing check, no model involved"
     img = encode(payload, palette=palette, patch_size=14, nsym=32, seed=0)
     _, _, symbols = extract_symbols(img, palette=palette, patch_size=14)
     target = symbols_to_target(symbols, palette)
 
     decoder = QwenVLDecoder(model=object(), processor=object(), palette=palette, subpatch=1)
+    # The prompt must list exactly `palette` alphabet characters -- for palette=128/256 this only
+    # works because SYMBOL_ALPHABET was extended past 64 (it used to truncate silently to 64).
+    prompt = decoder._build_prompt(img.width // 14, img.height // 14)
+    assert f'"{SYMBOL_ALPHABET[:palette]}"' in prompt
     # Simulate a perfect model response (wrapped in a fenced code block, as the prompt asks):
     fake_response = f"```\n{target}\n```"
     parsed_symbols = decoder._parse_symbols(fake_response)
