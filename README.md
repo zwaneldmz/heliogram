@@ -10,7 +10,10 @@ bits/patch** — the channel capacity of the patch grid, measured with a model-f
 reference decoder. Format details: [`spec/format-v0.1.md`](spec/format-v0.1.md).
 
 Apache-2.0. All data is synthetic and seed-deterministic; same inputs produce
-byte-identical PNGs.
+pixel-identical PNGs (the PNG *container* bytes can differ across Pillow
+versions — e.g. a chunk-encoding change between Pillow releases — but the
+decoded pixel grid, and therefore every symbol the codec reads back, is
+identical).
 
 ## Scope
 
@@ -20,6 +23,24 @@ byte-identical PNGs.
 - **Out of scope:** closed API models. Their preprocessing (resizing, tiling,
   re-compression, token accounting) is opaque and changeable, so no capacity claim
   made here transfers to them. We do not test against them and won't.
+
+**A note on scope vs. the JPEG numbers above.** The in-scope operator (previous
+bullet) controls preprocessing end to end, which means they can choose to serve
+lossless PNG straight through to the model — under that reading, the JPEG
+q70/q85/q95 corruption rows measured throughout this README and `RESULTS.md`
+are a robustness *margin* for pipelines that fall outside strict control (and a
+deliberate stress test), not the operative in-scope number; the clean-channel
+bits/patch and token-crossover figures are. That does not weaken the JPEG
+failure caveats above — `palette=128`/`256` really are measured to fail decode
+under JPEG q70 at every tested payload size, and that stays reported exactly as
+measured — it only names which number this project's scope claim actually rests
+on. The honest flip side: the one corruption an in-scope operator *cannot* opt
+out of is the target model's own image preprocessing — e.g. Qwen2.5-VL's
+`smart_resize`, which snaps input resolution to 28px (patch-size × merge-size)
+multiples before the ViT ever sees a pixel. That resize is not in this
+project's corruption suite yet; it is real, in-scope, and unmeasured, and
+belongs on the Phase-2 to-do list (see "Roadmap / Phase-2 boundary" below), not
+folded silently into the "clean" column above.
 
 This is a measurement project. If the numbers come out below the base64 line, that
 is a result, not a failure — it bounds what optical-context schemes can gain from
@@ -353,6 +374,56 @@ this repo yet:
 - Semantic use of optically-injected context (retrieval, tool outputs, logs).
 
 No model-based numbers appear anywhere in this repo until Phase 2 produces them.
+
+## Phase-2 safety release gate
+
+Phase 2, if it happens, deliberately trains a model to do one specific new thing:
+reliably read machine-dense, human-opaque images through realistic corruption.
+That is exactly the capability that makes image-borne prompt injection
+un-reviewable by a human in the loop — a payload a person can't visually tell
+apart from noise, that the model reads anyway, is a channel nobody watching the
+screen can catch. We built `heliogram.instruments.foreign_tile` (a structural
+pre-ingest guard) and `heliogram.instruments.injection_bench` (a behavioral-
+payload benchmark) in Phase 1, before any fine-tuning, on purpose — see
+"Instruments (gate-independent)" above: the detector ships before the
+capability does, not after. We are not going to reverse that ordering by
+shipping a tuned reader without also shipping the numbers that say whether the
+detector still catches it.
+
+Before we release any Phase-2 adapter or fine-tuned weights, we commit to
+publishing all three of the following, together, in the same measured,
+caveat-attached style this repo's other numbers already use — not a blog post,
+not a vibe:
+
+1. **Behavioral capacity, on the tuned model.** Run
+   `heliogram.instruments.injection_bench.measure_behavioral_capacity` against
+   the actual fine-tuned reader — not the pixel decoder — and publish however
+   much reliable behavioral influence (persona hijack, forced output schema,
+   triggered tool call) survives the corruption suite. This is exactly the
+   number `measure_behavioral_capacity` currently refuses to fabricate,
+   because there is no model to run it against yet (see "Instruments"
+   above); Phase 2 removes that excuse, and we intend to use it.
+2. **Detector TPR/FPR, measured against what the tuned model actually reads.**
+   Publish `heliogram.instruments.foreign_tile.guard`'s TPR at a bounded FPR,
+   measured against tiles the TUNED model decodes — not only tiles
+   `decode_pixels` decodes. A guard evaluated solely against the reference
+   pixel decoder says nothing about whether it also catches what a learned
+   reader, with its own generalization quirks, ends up picking up; this
+   project does not get to grade its own detector on the easy version of the
+   test.
+3. **A decision rule, stated in advance, before there is any incentive to
+   soften it:** no adapter or fine-tuned weights are released if behavioral
+   payloads survive corruption at rates `foreign_tile.guard` cannot catch at a
+   bounded false-positive rate. "Survive" and "catch" here mean exactly what
+   (1) and (2) above measure — a published number compared against another
+   published number, not a judgment call made after the fact.
+
+This gate is a commitment about what gets published and what release is
+conditioned on, not a claim that we have already run it: nothing in this repo
+has a GPU, so neither (1) nor (2) has been measured yet (see "Phase 2 (GPU)"
+below). We are writing the gate down before the fine-tuned model exists
+specifically so there is no room to relax it once there is a working model
+someone is proud of.
 
 ## Phase 2 (GPU) — how to run when you have a GPU
 
