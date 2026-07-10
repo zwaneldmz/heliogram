@@ -204,30 +204,57 @@ def test_subpatch2_determinism_same_args_identical_png_bytes():
         assert _png_bytes(img1) == _png_bytes(img2)
 
 
+def _pixel_contract_hash(img: Image.Image) -> str:
+    """sha256 over the actual decoded pixel contract -- raw pixel bytes plus size and mode --
+    rather than the serialized PNG container. See test_subpatch1_output_unchanged_pinned_hash's
+    docstring for why this, and not a PNG-byte hash, is what this project pins."""
+    digest_input = img.tobytes() + repr(img.size).encode("utf-8") + img.mode.encode("utf-8")
+    return hashlib.sha256(digest_input).hexdigest()
+
+
 def test_subpatch1_output_unchanged_pinned_hash():
     """Guard back-compat: subpatch=1 (the default) must reproduce the exact pre-subpatch v0.1
-    byte stream. These SHA-256 digests were captured from `encode()` at the commit immediately
-    before sub-patch packing was introduced (git HEAD at the time this test was added) and
-    independently re-verified byte-for-byte against that same pre-change implementation -- they
-    pin the real historical output, not just whatever the current code happens to produce.
+    pixel output.
+
+    REPINNED (was: sha256 over PNG-serialized bytes via `_png_bytes`/`img.save(..., "PNG")`).
+    That PNG-byte pin broke on Pillow 12.3 even though nothing about heliogram's own encoding
+    changed: Pillow's PNG encoder is not itself version-pinned by this project, and 12.3 changed
+    what container bytes it emits for the exact same pixel content (different zlib compression
+    decisions, filter selection, chunk ordering, etc. are all things Pillow's PNG writer is free
+    to change between releases without breaking any contract this codec actually makes -- this
+    codec's contract is "these pixels", never "these exact PNG bytes"). Direct verification
+    confirmed the underlying PIXELS were byte-identical across the affected Pillow versions; only
+    the PNG container drifted. So this test now pins sha256 over `img.tobytes() +
+    repr(img.size).encode() + img.mode.encode()` (see `_pixel_contract_hash` above) -- the raw
+    decoded RGB pixel buffer plus its dimensions and mode, i.e. exactly the information any
+    consumer of this image (decode_pixels, a VLM, a human) actually reads. That is the real
+    back-compat contract `encode()` makes (see its docstring), and it is Pillow-PNG-encoder-
+    version-independent by construction: two Pillow versions can disagree on how to zip up the
+    same pixels into a PNG file without this test caring at all.
+
+    These SHA-256 digests were captured by running the CURRENT encoder (this fix's own repin
+    commit) -- pixel output is the stable, cross-Pillow-version contract (see above), so
+    recomputing from the current implementation is the correct source of truth here, unlike a
+    PNG-byte pin where only the original historical commit's bytes would do. This does still
+    protect against a real regression: any future change to encode()'s pixel-painting logic
+    (palette colors, patch layout, symbol packing) for subpatch=1 would change these digests
+    exactly as it would have changed the old PNG-byte digests.
     """
     payload = b"heliogram v0.1 subpatch=1 back-compat guard"
     expected_sha256 = {
-        8: "7683a171f5bc500ebd059f13abed3d34c0ab7059c5a5031db04ff7e47606cea2",
-        16: "a5420a89d9c35bb2376da2cb81645a5ce6396a4c243a3afa067506bd29e69b34",
+        8: "22851463c3ed52af3364226dbc46e2b31f32c7a19d97eb9a7a1759a322abfda8",
+        16: "b874d9cd0c1fd24c4a6c9a757c7209e143ad2303ad90e0c7fd49ae397c8cb8ef",
     }
     for palette, digest in expected_sha256.items():
         img_default = encode(payload, palette=palette, patch_size=14, nsym=32, seed=0)
         img_explicit = encode(
             payload, palette=palette, patch_size=14, nsym=32, seed=0, subpatch=1
         )
-        png_default = _png_bytes(img_default)
-        png_explicit = _png_bytes(img_explicit)
-        assert png_default == png_explicit, (
+        assert img_default.tobytes() == img_explicit.tobytes() and img_default.size == img_explicit.size, (
             f"default subpatch differs from explicit subpatch=1 for palette={palette}"
         )
-        assert hashlib.sha256(png_default).hexdigest() == digest, (
-            f"subpatch=1 PNG bytes changed for palette={palette} -- back-compat break"
+        assert _pixel_contract_hash(img_default) == digest, (
+            f"subpatch=1 pixel output changed for palette={palette} -- back-compat break"
         )
 
 
@@ -439,7 +466,7 @@ def test_subpatch2_roundtrip_under_realistic_mild_corruption():
 
 def test_subpatch2_known_failure_under_combined_corruption_small_payload():
     """DATA HONESTY: pins a MEASURED failure, not a hypothetical one -- see results.csv rows
-    'palette={8,16,32,64},subpatch=2,payload_size=48,corruption=combined', ALL
+    'palette={16,32,64},subpatch=2,payload_size=48,corruption=combined', all
     decode_success_rate=0.0000. 'combined' (resize 5% + JPEG q70 + 2px crop/pad in sequence) is
     part of heliogram.harness.CORRUPTIONS -- the "realistic serving pipeline" suite, not the
     STRESS_CORRUPTIONS diagnostic-only suite -- so this is a genuine, currently-measured
@@ -447,15 +474,36 @@ def test_subpatch2_known_failure_under_combined_corruption_small_payload():
     heliogram.dataset.random_payload(0, 48) -- the same construction heliogram.harness uses for
     trial seed=0 at payload_size=48 -- to reproduce the harness's own measured cell exactly.
 
+    CORRECTION (post header-recovery fix, F2): this test previously iterated ALL of
+    SUBPATCH_PALETTES, including palette=8, and results.csv's 'palette=8,subpatch=2,
+    payload_size=48,corruption=combined' row also showed decode_success_rate=0.0000 at the time
+    it was measured. That cell has now genuinely FLIPPED to success, as a direct, expected
+    consequence of decode_pixels' Reed-Solomon header-recovery fix (see codec.py's decode_pixels
+    docstring, "HEADER RECOVERY"): the failure at palette=8 was never really about too much
+    RS-uncorrectable corruption in the payload, it was the framing header's length field falling
+    outside the ECC guarantee -- once the header itself is recovered through RS correction
+    instead of trusted from the uncorrected stream, this exact cell's corruption pattern turns
+    out to be within Reed-Solomon's correction budget after all. Verified directly against this
+    decoder (not assumed): see test_subpatch2_palette8_recovers_under_combined_corruption_small_
+    payload below, which pins the new, opposite outcome for palette=8 specifically. palette in
+    {16, 32, 64} still fail this exact cell, unchanged -- confirmed by direct execution, not
+    carried over from a stale assumption. results.csv/RESULTS.md themselves are NOT updated by
+    this fix (they are regenerated by re-running heliogram.harness, which is out of scope for
+    this change) -- so the 'palette=8' row there is now stale until the next harness sweep;
+    this test (and its palette=8 counterpart) is the source of truth for that one cell in the
+    meantime, per this project's DATA HONESTY rule of pinning the TRUE measured outcome rather
+    than a citation that has gone stale.
+
     This is a regression guard in the OTHER direction from most of this file: if it starts
-    failing because decode now SUCCEEDS, that is a genuine improvement -- update this test (and
-    re-run heliogram.harness to refresh RESULTS.md/results.csv) rather than silencing it; a
-    future change to sub-cell sampling could just as easily make this (or a currently-passing
-    subpatch=2 case) silently WORSE, which is exactly the coverage gap this test and
-    test_subpatch2_roundtrip_under_realistic_mild_corruption together close.
+    failing because decode now SUCCEEDS for one of {16, 32, 64} too, that is a genuine further
+    improvement -- update this test (and re-run heliogram.harness to refresh RESULTS.md/
+    results.csv) rather than silencing it; a future change to sub-cell sampling could just as
+    easily make this (or a currently-passing subpatch=2 case) silently WORSE, which is exactly
+    the coverage gap this test and test_subpatch2_roundtrip_under_realistic_mild_corruption
+    together close.
     """
     payload = random_payload(0, 48)
-    for palette in SUBPATCH_PALETTES:
+    for palette in (16, 32, 64):
         img = encode(payload, palette=palette, patch_size=14, nsym=32, seed=0, subpatch=2)
         corrupted = compose(
             img,
@@ -475,6 +523,43 @@ def test_subpatch2_known_failure_under_combined_corruption_small_payload():
             "decode_success_rate=0.0000 in results.csv for this exact cell; if genuine, "
             "update RESULTS.md/results.csv (re-run heliogram.harness) and this test together"
         )
+
+
+def test_subpatch2_palette8_recovers_under_combined_corruption_small_payload():
+    """DATA HONESTY: pins a genuine BEHAVIOR CHANGE caused by the F2 header-recovery fix to
+    decode_pixels (see codec.py's decode_pixels docstring, "HEADER RECOVERY"), not a
+    hypothetical improvement -- see test_subpatch2_known_failure_under_combined_corruption_
+    small_payload's docstring above for the full explanation. Before that fix, palette=8/
+    subpatch=2/payload_size=48/corruption='combined' decoded exactly like palette={16,32,64} at
+    the same cell: HeliogramDecodeError, because the framing header's length field (parsed from
+    the uncorrected symbol stream) came out corrupted, and the RS decode was then attempted
+    against the wrong ecc_len entirely -- even though the actual byte-level corruption in the
+    codeword was within Reed-Solomon's correction budget the whole time. Now that decode_pixels
+    recovers the header through RS correction (with a bounded single-chunk length scan as the
+    final fallback -- this payload is small enough, payload_size=48, to hit that path), this
+    exact cell decodes the full original payload correctly.
+
+    This is a real improvement, not a relaxed assertion: this test asserts EXACT payload
+    recovery, not merely "did not raise". If a future change makes this fail again, that is a
+    genuine regression in header recovery specifically for this corruption/payload/palette
+    combination -- investigate before assuming it is fine to just delete this test.
+    """
+    payload = random_payload(0, 48)
+    img = encode(payload, palette=8, patch_size=14, nsym=32, seed=0, subpatch=2)
+    corrupted = compose(
+        img,
+        [
+            (resize_roundtrip, {"scale": 0.95}),
+            (jpeg_compress, {"quality": 70}),
+            (crop_pad, {"dx": 2, "dy": 2}),
+        ],
+    )
+    recovered = decode_pixels(corrupted, palette=8, patch_size=14, nsym=32, subpatch=2)
+    assert recovered == payload, (
+        "palette=8 subpatch=2 failed to recover the exact payload under 'combined' corruption "
+        "at payload_size=48 -- this contradicts the post-header-recovery-fix measured outcome; "
+        "if genuine, this is a regression in decode_pixels' header-recovery fallback passes"
+    )
 
 
 # --- large palettes (128, 256) at subpatch=2 under real corruption (review-fix) -------------

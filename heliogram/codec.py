@@ -39,6 +39,14 @@ pixel, recover calibration colors from row 0, nearest-neighbor classify data pat
 ecc bitstream, RS-decode, strip the header, and return the payload. It is deliberately the whole
 channel: no semantic understanding, just raw color->symbol recovery. Phase 2 (out of scope here
 -- no GPU available) replaces this classifier with a fine-tuned VLM; see VLMDecoder below.
+
+Header recovery: `payload_len` (the 4-byte field above) is NOT trusted from the uncorrected
+symbol stream -- it is always re-derived from the Reed-Solomon-CORRECTED message, with a
+guess-and-one-retry fast path, a multi-chunk first-codeword recovery pass, and a bounded
+single-chunk length scan as successive fallbacks before giving up. See decode_pixels' own
+docstring for the exact three-pass order and the DATA HONESTY caveat on RS mis-correction risk
+beyond its guaranteed-detection budget (this fixes what used to be a single point of failure
+sitting outside the ECC guarantee -- see git history / the fix that added this note for details).
 """
 
 from __future__ import annotations
@@ -228,8 +236,12 @@ def encode(
     subpatch: int = 1,
 ) -> Image.Image:
     """Encode `data` as a heliogram codec v0.1 image. Deterministic: identical arguments always
-    produce a byte-identical PNG (the palette/layout have no randomness; `seed` is accepted for
-    API stability / future use, e.g. dithering, but has no effect on v0.1 output).
+    produce a pixel-identical image (the palette/layout have no randomness; `seed` is accepted
+    for API stability / future use, e.g. dithering, but has no effect on v0.1 output) -- the PNG
+    CONTAINER bytes may differ across Pillow versions even for pixel-identical output (Pillow's
+    PNG encoder is not itself pinned by this project), so pin img.tobytes() (plus size/mode), not
+    a PNG-byte hash, if you need a byte-for-byte determinism guard; see
+    tests/test_roundtrip.py::test_subpatch1_output_unchanged_pinned_hash.
 
     `subpatch` (k, default 1) subdivides each DATA patch into a k x k grid of `patch_size/k`-px
     solid-color sub-cells, each carrying one symbol -- k*k symbols per data patch instead of 1.
@@ -354,6 +366,49 @@ def extract_symbols(
     return width, height, symbols
 
 
+def _attempt(stream: bytes, payload_len: int, nsym: int, depth: int = 0) -> Optional[bytes]:
+    """Try to Reed-Solomon decode `stream` on the hypothesis that the framed message's payload is
+    `payload_len` bytes long (message_len = 5 + payload_len). Returns the recovered payload on
+    success, or None on ANY failure (never raises) -- `decode_pixels` is responsible for turning a
+    final None (every strategy exhausted) into HeliogramDecodeError.
+
+    This is the core of the F2 fix ("header outside the ECC guarantee"): `payload_len` is only
+    ever used here to decide how many bytes to feed `RSCodec.decode` -- the header that actually
+    gets trusted for the returned slice is always re-read from `decoded_message`, i.e. AFTER
+    Reed-Solomon has had a chance to correct it, never from the possibly-corrupted raw `stream`.
+    So corruption landing on the ~40-bit length field no longer kills the decode the way it used
+    to when that field was parsed straight from the uncorrected stream and trusted outright.
+
+    depth=0 (the normal entry, called with a tentative/guessed `payload_len`): if the CORRECTED
+    header's length field disagrees with the `payload_len` this call was invoked with, that
+    corrected value just survived Reed-Solomon and is itself trustworthy -- retry once (depth=1)
+    using it. depth=1 never recurses again: if its own corrected header still disagrees with what
+    it was called with, guessing further would not be principled (most likely the ecc_len this
+    call used doesn't align with the true codeword boundary at all), so give up and return None
+    and let `decode_pixels`'s other recovery passes (multi-chunk header recovery, bounded scan)
+    try a different strategy instead of spinning on more guesses here.
+    """
+    message_len = 5 + payload_len
+    ecc_len = rs_encoded_length(message_len, nsym)
+    if len(stream) < ecc_len:
+        return None
+    try:
+        decoded_message, _, _ = RSCodec(nsym).decode(bytes(stream[:ecc_len]))
+    except Exception:  # reedsolo raises ReedSolomonError on uncorrectable input
+        return None
+    decoded_message = bytes(decoded_message)
+    if len(decoded_message) < 5 or decoded_message[0] != CODEC_VERSION:
+        return None
+    hdr_len = struct.unpack(">I", decoded_message[1:5])[0]
+    if hdr_len == payload_len:
+        if len(decoded_message) < 5 + hdr_len:
+            return None  # decoded shorter than its own declared length -- inconsistent, bail
+        return decoded_message[5 : 5 + hdr_len]
+    if depth == 0:
+        return _attempt(stream, hdr_len, nsym, depth=1)
+    return None
+
+
 def decode_pixels(
     img: Image.Image,
     palette: int = 8,
@@ -364,43 +419,125 @@ def decode_pixels(
     """Reference, model-free decoder. Sample each patch's (or, for subpatch=k>1, each sub-cell's)
     center pixel, recover calibration colors from row 0, nearest-neighbor classify data patches,
     rebuild the ecc bitstream, RS-decode, strip the header, and return the payload. Raises
-    HeliogramDecodeError if the recovered stream cannot be parsed or RS-corrected.
+    HeliogramDecodeError if the recovered stream cannot be parsed or RS-corrected by any of the
+    strategies below.
 
     `subpatch` must match the value `img` was encoded with (see `encode`'s docstring); it is not
     a self-describing field in the byte stream.
+
+    HEADER RECOVERY (fixes F2, "header outside the ECC guarantee"): the framing header's
+    `payload_len` field (message[1:5], 4 bytes big-endian) used to be parsed straight from the
+    UNCORRECTED recovered symbol stream and then trusted for the final payload slice -- meaning
+    corruption landing on those ~40 bits (a tiny fraction of a multi-hundred-byte codeword) could
+    kill an otherwise perfectly Reed-Solomon-correctable decode. That length field sat OUTSIDE the
+    very ECC guarantee protecting everything around it: a single point of failure in a format
+    whose whole point is surviving corruption. That is fixed now -- the header is always read from
+    the RS-CORRECTED message, never trusted uncorrected, via three fallback passes tried in order
+    (clean-path decodes still return from pass 1, byte-for-byte identical to before this fix):
+
+      1. Parse a tentative `payload_len` from `stream[1:5]` AS-IS (today's fast path -- correct
+         for the overwhelming majority of clean or lightly-corrupted images) and hand it to
+         `_attempt` (depth=0). `_attempt` re-derives the trustworthy, RS-corrected header from the
+         decode itself, and if that disagrees with the tentative guess, retries once (depth=1)
+         using the corrected value before giving up -- see `_attempt`'s docstring. This alone
+         recovers header corruption within Reed-Solomon's correction budget (up to
+         floor(nsym/2) byte errors in the chunk covering the header) that would previously have
+         been fatal even though the RS layer could trivially have fixed it.
+      2. If pass 1 fails and the recovered stream is at least RS_NSIZE (255) bytes long -- i.e.
+         large enough that reedsolo would have split it into multiple chunks -- RS-decode just the
+         first RS_NSIZE-byte codeword in isolation. reedsolo always emits a full RS_NSIZE-byte
+         first chunk for a multi-chunk message, so that chunk alone contains the whole 5-byte
+         header, protected by its own chunk's parity independent of chunk 2+. Read `payload_len`
+         from THAT corrected header and retry `_attempt` with it. This recovers header corruption
+         severe enough that pass 1's guess-and-one-retry both landed on the wrong codeword
+         boundary and failed outright.
+      3. If that also fails, bounded-scan every `message_len` from 5 up to the largest value
+         reedsolo would still treat as a single chunk (RS_NSIZE - nsym), RS-decoding
+         `stream[:message_len + nsym]` at each candidate. A candidate is accepted ONLY if the
+         decoded version byte equals CODEC_VERSION AND the decoded length field is exactly
+         self-consistent with the `message_len` tried (i.e. equals `message_len - 5`) -- this is a
+         last resort, not a guess dressed up as a certainty: trailing symbol-0 grid padding after
+         the true codeword overwhelmingly fails RS decode outright at the wrong boundary, and the
+         version+length double-check makes a false accept at a boundary RS happened not to reject
+         astronomically unlikely.
+      4. If every pass above fails, raise HeliogramDecodeError.
+
+    DATA HONESTY: bounded-distance Reed-Solomon decoding (what every `RSCodec.decode` call above
+    does) GUARANTEES correction only up to t = floor(nsym/2) byte errors per RS_NSIZE-byte chunk,
+    and GUARANTEES detection (raising rather than returning anything) only up to nsym-t errors.
+    Beyond nsym-t errors in a chunk, RS decoding can MIS-CORRECT: land on a different, wrong, but
+    internally-consistent codeword and return wrong bytes without raising at all -- a property of
+    the code, not a bug in this implementation, and exactly why pass 3 above insists on BOTH the
+    version byte and the length-field self-consistency check rather than accepting the first
+    candidate that merely fails to raise. See the module docstring for the same caveat applied to
+    RS-protection generally: "detects corruption" / "raises rather than silently returning wrong
+    bytes" claims elsewhere in this project hold only up to nsym-t errors, not unconditionally.
     """
     bps = bits_per_symbol(palette)
     _, _, symbols = extract_symbols(img, palette=palette, patch_size=patch_size, subpatch=subpatch)
-    stream = _symbols_to_bytes(symbols, bps)
+    stream = bytes(_symbols_to_bytes(symbols, bps))
 
     if len(stream) < 5:
         raise HeliogramDecodeError("recovered stream shorter than the 5-byte framing header")
 
-    payload_len = struct.unpack(">I", stream[1:5])[0]
-    message_len = 5 + payload_len
-    ecc_len = rs_encoded_length(message_len, nsym)
-    if len(stream) < ecc_len:
-        raise HeliogramDecodeError(
-            f"recovered stream too short ({len(stream)}B) for the framed message "
-            f"({ecc_len}B expected) -- image likely too corrupted or too small"
-        )
+    # Pass 1: tentative length from the uncorrected stream, same starting guess as before this
+    # fix -- the fast path that is correct for the overwhelming majority of clean or lightly
+    # corrupted images. `_attempt` re-derives the trustworthy (RS-corrected) header itself and
+    # retries once if the tentative guess disagrees with it (see _attempt's docstring above).
+    tentative_len = struct.unpack(">I", stream[1:5])[0]
+    result = _attempt(stream, tentative_len, nsym)
+    if result is not None:
+        return result
 
-    ecc_bytes = bytes(stream[:ecc_len])
-    try:
-        decoded_message, _, _ = RSCodec(nsym).decode(ecc_bytes)
-    except Exception as exc:  # reedsolo raises ReedSolomonError on uncorrectable input
-        raise HeliogramDecodeError(f"Reed-Solomon decode failed: {exc}") from exc
+    # Pass 2a: multi-chunk header recovery. reedsolo chunks messages longer than
+    # (RS_NSIZE - nsym) bytes into RS_NSIZE-byte codewords, so a multi-chunk message's first
+    # chunk is always a full, independently-correctable RS_NSIZE bytes containing the whole
+    # 5-byte header. RS-decoding just that first chunk in isolation recovers a header that was
+    # too corrupted for pass 1 (which guessed from the raw bytes and retried once) to land on the
+    # right codeword boundary at all.
+    if len(stream) >= RS_NSIZE:
+        try:
+            first_chunk, _, _ = RSCodec(nsym).decode(bytes(stream[:RS_NSIZE]))
+        except Exception:  # reedsolo raises ReedSolomonError on uncorrectable input
+            first_chunk = None
+        if first_chunk is not None:
+            first_chunk = bytes(first_chunk)
+            if len(first_chunk) >= 5:
+                candidate_len = struct.unpack(">I", first_chunk[1:5])[0]
+                result = _attempt(stream, candidate_len, nsym)
+                if result is not None:
+                    return result
 
-    decoded_message = bytes(decoded_message)
-    if len(decoded_message) < message_len:
-        raise HeliogramDecodeError("decoded message shorter than the expected framing")
-    if decoded_message[0] != CODEC_VERSION:
-        raise HeliogramDecodeError(
-            f"unsupported/corrupted codec version byte {decoded_message[0]!r} "
-            f"(expected {CODEC_VERSION})"
-        )
+    # Pass 2b: bounded single-chunk scan, last resort. Only message_len values small enough that
+    # reedsolo would treat the whole message as ONE chunk are tried (message_len <= RS_NSIZE -
+    # nsym), so this never guesses chunk boundaries for a multi-chunk message (pass 2a handles
+    # those). A candidate is accepted only if BOTH the corrected version byte matches
+    # CODEC_VERSION AND the corrected length field is exactly self-consistent with the
+    # message_len tried -- see this function's docstring for why that double-check makes a false
+    # accept astronomically unlikely rather than merely unlikely.
+    for message_len in range(5, RS_NSIZE - nsym + 1):
+        ecc_len = message_len + nsym
+        if ecc_len > min(len(stream), RS_NSIZE):
+            break
+        try:
+            decoded, _, _ = RSCodec(nsym).decode(bytes(stream[:ecc_len]))
+        except Exception:  # reedsolo raises ReedSolomonError on uncorrectable input
+            continue
+        decoded = bytes(decoded)
+        if (
+            len(decoded) >= message_len
+            and decoded[0] == CODEC_VERSION
+            and struct.unpack(">I", decoded[1:5])[0] == message_len - 5
+        ):
+            return decoded[5:message_len]
 
-    return decoded_message[5 : 5 + payload_len]
+    raise HeliogramDecodeError(
+        "could not recover a valid framed message from the recovered pixel stream: neither the "
+        "tentative header (pass 1), RS-corrected multi-chunk header recovery (pass 2a), nor a "
+        "bounded single-chunk length scan (pass 2b) produced a self-consistent version+length "
+        f"header (recovered stream length {len(stream)}B) -- image likely too corrupted or too "
+        "small"
+    )
 
 
 DecoderFn = Callable[..., bytes]
