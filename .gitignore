@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 demo_output.png
 .claude/
+heliogram-phase2-plan.pdf
