@@ -44,18 +44,16 @@ reason. See `heliogram/dataset.py`'s module docstring for the full "PROMPT/OUTPU
 UNIFICATION" note, including the row-per-line (not fenced-code-block) output contract change and
 why (`SYMBOL_ALPHABET` includes the backtick character).
 
-KNOWN, OUT-OF-SCOPE-FOR-THIS-MODULE GAP (see `heliogram/dataset.py`'s "PROCESSOR RESIZE HAZARD"
-note): `heliogram.dataset.generate_examples`/`write_dataset` pad every TRAINING image to an even
-patch-grid width/height so Qwen's `smart_resize` is the identity transform on it. `_generate`
-below does NOT apply that same padding to `img` before calling `processor(...)` -- images reaching
-`QwenVLDecoder` at INFERENCE time come straight from `heliogram.codec.encode()` (real deployment,
-not this repo's training-data generator), which has no guarantee of even patch-grid dimensions.
-A production `encode()` output with an odd patch-count dimension would still hit the same resize
-hazard at inference time. Fixing this is out of scope for this group's assignment (scoped to
-`scripts/train_qlora.py` + `heliogram/dataset.py` + `scripts/gen_dataset.py`); flagged here so it
-is not mistaken for "fixed everywhere" -- a real deployment should pad (or otherwise guarantee
-28px-alignment for) images before they reach `QwenVLDecoder`, mirroring
-`heliogram.dataset.pad_to_even_patch_grid`.
+KNOWN GAP, NOW WITH A ONE-ARGUMENT FIX (see `heliogram/dataset.py`'s "PROCESSOR RESIZE HAZARD"
+note): `heliogram.dataset.generate_examples`/`write_dataset` emit only 28px-aligned TRAINING
+images (via `heliogram.codec.encode(..., align=2)`) so Qwen's `smart_resize` is the identity
+transform on them. `_generate` below does NOT verify alignment of `img` before calling
+`processor(...)` -- images reaching `QwenVLDecoder` at INFERENCE time come from whatever the
+deployment encoded. A production deployment targeting a 2x2-merge VLM should therefore ALSO
+encode with `align=2` (an ordinary v0.1 grid that `decode_pixels` round-trips with no flag --
+see `heliogram.codec.compute_grid`'s docstring); an unaligned image with an odd patch-count
+dimension hits the measured `qwen_smart_resize` misalignment corruption at inference time
+(see RESULTS.md's qwen_smart_resize rows for how badly that ends).
 """
 
 from __future__ import annotations
@@ -713,6 +711,16 @@ def teacher_forced_symbol_accuracy(
     import torch  # lazy: heavy GPU dep, see module docstring -- deferred until every pure-Python
     # guard clause above (model/processor presence, target-length, tokenizer-alignment checks)
     # has already had a chance to raise without requiring torch to be installed.
+
+    # Move inputs to the model's device: the processor returns CPU tensors, and a CUDA-resident
+    # model given CPU inputs is a device-mismatch crash (device_map="auto" runs sometimes get
+    # away with it via accelerate's dispatch hooks, but single-device loads do not). Mirrors
+    # QwenVLDecoder._generate's identical move.
+    target_device = getattr(model, "device", None)
+    if target_device is not None:
+        full_inputs = {
+            k: (v.to(target_device) if hasattr(v, "to") else v) for k, v in full_inputs.items()
+        }
 
     with torch.no_grad():
         logits = model(**full_inputs).logits[0]  # (seq_len, vocab)

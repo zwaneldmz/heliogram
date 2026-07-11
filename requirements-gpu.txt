@@ -13,6 +13,9 @@
 # Loosely pinned (lower bounds only) -- untested in this repo (no GPU here); pin exact versions
 # once you have verified a working combination on your hardware.
 torch>=2.1
+# transformers 5.x's Qwen2-VL image processor imports torchvision at module load (verified
+# against transformers 5.13.0) -- required even for the CPU-side processor calls.
+torchvision
 transformers>=4.46
 peft>=0.11
 bitsandbytes>=0.43

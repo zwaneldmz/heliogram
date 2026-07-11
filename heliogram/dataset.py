@@ -59,26 +59,23 @@ DEFAULTS (which palettes/subpatches its own generation functions emphasize when 
 doesn't override them) are picked to produce training data for exactly that question, not
 spread thin across every palette in `VALID_PALETTES` uniformly as before this retarget.
 
-PROCESSOR RESIZE HAZARD (why `generate_examples`/`write_dataset` pad every image -- see
-`pad_to_even_patch_grid` below): Qwen2-VL/Qwen2.5-VL's own image processor calls a `smart_resize`
-step that snaps input pixel dimensions to a multiple of `patch_size * merge_size` (14px * 2 =
-28px for Qwen2.5-VL) BEFORE the vision tower ever sees the image -- this is unconditional
-processor behavior, not something a prompt or fine-tune can opt out of. `heliogram.codec`'s own
-patch grid is only ever guaranteed aligned to `PATCH_SIZE` (14px); a grid whose patch-count width
-or height is ODD (`compute_grid` has no notion of Qwen's 2x2 merge -- it cannot, since
-`heliogram/codec.py` is out of scope to edit in this slice) therefore has a pixel dimension that
-is an odd multiple of 14, i.e. NOT a multiple of 28 -- the processor's `smart_resize` then
-resamples that dimension onto a different pixel grid than the one `encode()` painted, an
-UNCONTROLLED corruption introduced by merely feeding the image to the model, on top of (and
-arguably worse than -- it happens even to a perfectly clean image) anything in
-`heliogram.corruption`'s realistic-serving-pipeline suite. `pad_to_even_patch_grid` fixes this at
-the source: every image `generate_examples`/`write_dataset` emits has BOTH patch-grid dimensions
-even, so its pixel dimensions are already exact multiples of 28 and `smart_resize` (given
-matching `min_pixels`/`max_pixels`, see `scripts/train_qlora.py`'s `_identity_pixel_bounds`) is
-the identity transform. See `pad_to_even_patch_grid`'s own docstring for the exact padding
-scheme and its one documented tradeoff (it can break `decode_pixels` byte-for-byte roundtrip on
-the padded image when a COLUMN was added -- irrelevant for this module's actual use, VLM
-training/eval, but worth knowing if you reuse a padded `Example.image` for something else).
+PROCESSOR RESIZE HAZARD (why `generate_examples`/`write_dataset` emit only 28px-aligned images):
+Qwen2-VL/Qwen2.5-VL's own image processor calls a `smart_resize` step that snaps input pixel
+dimensions to a multiple of `patch_size * merge_size` (14px * 2 = 28px for Qwen2.5-VL) BEFORE
+the vision tower ever sees the image -- this is unconditional processor behavior, not something
+a prompt or fine-tune can opt out of (it is now also a measured corruption row:
+`heliogram.harness.CORRUPTIONS["qwen_smart_resize"]`). A grid whose patch-count width or height
+is ODD has a pixel dimension that is an odd multiple of 14, i.e. NOT a multiple of 28 -- the
+processor's `smart_resize` then resamples that dimension onto a different pixel grid than the
+one `encode()` painted, an UNCONTROLLED corruption introduced by merely feeding the image to the
+model. `generate_examples` fixes this at the source with `heliogram.codec.encode(..., align=2)`:
+the grid is rounded up to even patch dimensions BEFORE layout, so every emitted image's pixel
+dimensions are exact multiples of 28 and `smart_resize` (given matching `min_pixels`/
+`max_pixels`, see `scripts/train_qlora.py`'s `_identity_pixel_bounds`) is the identity
+transform -- and, unlike the earlier post-hoc `pad_to_even_patch_grid` construction this
+replaced, an align=2 image is an ordinary v0.1 grid that `decode_pixels` round-trips bit-exactly
+in every case (post-hoc COLUMN padding broke round-trip; see `pad_to_even_patch_grid`'s
+docstring, kept for callers that must pad an EXISTING image's pixels).
 
 PROMPT/OUTPUT-CONTRACT UNIFICATION (D5(b)/D5(d) of the Phase-2 scaffold review): `build_prompt`,
 `format_output_text`, and `parse_output_text` below are the ONLY prompt-wording and
@@ -376,11 +373,13 @@ def pad_to_even_patch_grid(img: Image.Image, patch_size: int, palette: int) -> I
     module docstring's "PROCESSOR RESIZE HAZARD" note for why this matters (Qwen's image
     processor snaps pixel dimensions to a multiple of `patch_size * 2`, and an odd patch-count
     dimension is exactly the case where that snap resamples the image off its own symbol
-    lattice). No-op (returns `img` itself, unchanged) when both dimensions are already even --
-    which, empirically, is most of this project's actual training configurations (`palette` in
-    `DEFAULT_PALETTES` keeps `width` even for every `DEFAULT_PAYLOAD_SIZES`/curriculum-stage
-    payload size this project uses, since `compute_grid`'s `width = max(palette, ceil(sqrt(n)))`
-    and every `DEFAULT_PALETTES` value is itself even; `height` is the dimension that varies).
+    lattice). No-op (returns `img` itself, unchanged) when both dimensions are already even.
+
+    NO LONGER `generate_examples`' construction: dataset generation now aligns the grid BEFORE
+    layout via `heliogram.codec.encode(..., align=2)` (see the module docstring), which has no
+    decode-roundtrip caveat at all. This function is kept for callers that must pad an EXISTING
+    image's pixels (an image they did not encode themselves, or one whose layout is already
+    fixed) -- with the documented COLUMN-padding tradeoff below.
 
     HOW: extends the image by one extra column (if width is odd) and/or one extra row (if height
     is odd), each exactly `patch_size` px, filled with LEGITIMATE calibration/data colors (never
@@ -544,14 +543,27 @@ def generate_examples(
         trial_seed = seed + i
 
         payload = random_payload(trial_seed, payload_size)
+        # align=2 makes encode() itself emit an even patch-grid width/height (pixel dims are
+        # multiples of 28 = patch*merge), so Qwen's smart_resize is the identity on every image
+        # this generator emits -- see the module docstring's "PROCESSOR RESIZE HAZARD" note.
+        # This replaced the earlier encode-then-pad_to_even_patch_grid construction: grid
+        # alignment BEFORE layout keeps the image an ordinary, decode_pixels-round-trippable
+        # v0.1 grid in every case (post-hoc COLUMN padding broke round-trip, a documented
+        # tradeoff pad_to_even_patch_grid still carries for callers that need pixel-level
+        # padding of an existing image), and it is exactly what a production encoder targeting
+        # a 2x2-merge VLM should ship (heliogram.codec.encode(..., align=2)) -- so training
+        # images and deployment images are now the SAME construction, not merely equivalent.
+        # `target` below is read off this aligned image, so it always matches exactly what a
+        # downstream VLM prompt (build_prompt) will ask for.
         clean_img = encode(
-            payload, palette=palette, patch_size=patch_size, nsym=nsym, seed=0, subpatch=subpatch
+            payload,
+            palette=palette,
+            patch_size=patch_size,
+            nsym=nsym,
+            seed=0,
+            subpatch=subpatch,
+            align=2,
         )
-        # Pad to an even patch-grid width/height BEFORE reading ground truth off it -- see
-        # pad_to_even_patch_grid's docstring and the module docstring's "PROCESSOR RESIZE HAZARD"
-        # note. `target` below is read off this (possibly padded) image, not the pre-pad one, so
-        # it always matches exactly what a downstream VLM prompt (build_prompt) will ask for.
-        clean_img = pad_to_even_patch_grid(clean_img, patch_size, palette)
         _, _, truth_symbols = extract_symbols(
             clean_img, palette=palette, patch_size=patch_size, subpatch=subpatch
         )

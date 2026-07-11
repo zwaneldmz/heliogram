@@ -90,10 +90,24 @@ train_qlora = _load_train_qlora_module()
 def test_import_heliogram_does_not_pull_in_torch():
     """The central Phase-2 scaffold invariant: `import heliogram` (and, transitively,
     heliogram.dataset / heliogram.vlm) must never require torch/transformers/peft/bitsandbytes.
-    This test doesn't just check the import succeeded (that's implicit in collecting this file
-    at all) -- it asserts torch was never actually loaded as a side effect."""
-    assert "torch" not in sys.modules
-    assert "transformers" not in sys.modules
+    Checked in a FRESH subprocess, not via this process's sys.modules: other test files (the
+    GPU-path contract tests) legitimately import torch when it is installed, so an in-process
+    sys.modules assertion is order-dependent -- it would pass or fail based on which tests ran
+    first, not on whether heliogram's import graph is actually clean."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import heliogram; "
+            "assert 'torch' not in sys.modules, 'heliogram imported torch'; "
+            "assert 'transformers' not in sys.modules, 'heliogram imported transformers'",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_heliogram_reexports_phase2_names():
@@ -170,12 +184,14 @@ def test_generate_examples_deterministic():
 
 def test_generate_examples_ground_truth_matches_codec_clean_roundtrip():
     """The core correctness property: target is exactly what extract_symbols reads off a fresh
-    clean re-encode of the same payload, ONCE THAT RE-ENCODE IS PADDED THE SAME WAY
-    generate_examples pads it (pad_to_even_patch_grid, D4 -- see that function's docstring) --
-    and, when corruption_prob=0.0 (the default) AND no column padding was needed (width was
-    already even), decoding the returned image with decode_pixels recovers the exact original
-    payload (see pad_to_even_patch_grid's docstring's documented tradeoff: a COLUMN-padded image
-    is not expected to round-trip through decode_pixels, only a row-padded or unpadded one)."""
+    clean re-encode of the same payload, USING THE SAME CONSTRUCTION generate_examples uses
+    (encode(..., align=2) -- grid aligned BEFORE layout, which replaced the earlier
+    encode-then-pad_to_even_patch_grid construction; see generate_examples' body comment) --
+    and, when corruption_prob=0.0 (the default), decoding the returned image with decode_pixels
+    recovers the exact original payload UNCONDITIONALLY. That unconditional round-trip is
+    align=2's improvement over post-hoc padding: an aligned grid is an ordinary v0.1 grid, so
+    there is no column-padding case that breaks decode (the old construction's documented
+    tradeoff)."""
     for ex in generate_examples(
         6, palettes=VALID_PALETTES, subpatches=(1,), payload_sizes=(16, 48), seed=1
     ):
@@ -187,30 +203,28 @@ def test_generate_examples_ground_truth_matches_codec_clean_roundtrip():
             nsym=ex.nsym,
             seed=0,
             subpatch=ex.subpatch,
+            align=2,
         )
-        width_before_padding = clean_img.width // ex.patch_size
-        clean_img = pad_to_even_patch_grid(clean_img, ex.patch_size, ex.palette)
         _, _, truth_symbols = extract_symbols(
             clean_img, palette=ex.palette, patch_size=ex.patch_size, subpatch=ex.subpatch
         )
         assert target_to_symbols(ex.target, ex.palette) == truth_symbols
 
-        # Every image generate_examples emits has an even patch grid, regardless of whether
-        # padding fired (D4's actual guarantee -- see test_generate_examples_images_always_have_
-        # even_patch_grid below for a dedicated, broader test of this).
+        # Every image generate_examples emits has an even patch grid (D4's actual guarantee --
+        # see test_generate_examples_images_always_have_even_patch_grid below for a dedicated,
+        # broader test of this).
         assert (ex.image.width // ex.patch_size) % 2 == 0
         assert (ex.image.height // ex.patch_size) % 2 == 0
 
         assert ex.corruption == "clean"  # corruption_prob defaults to 0.0
-        if width_before_padding % 2 == 0:  # no column was added -- decode_pixels still works
-            recovered = decode_pixels(
-                ex.image,
-                palette=ex.palette,
-                patch_size=ex.patch_size,
-                nsym=ex.nsym,
-                subpatch=ex.subpatch,
-            )
-            assert recovered == ex.payload
+        recovered = decode_pixels(
+            ex.image,
+            palette=ex.palette,
+            patch_size=ex.patch_size,
+            nsym=ex.nsym,
+            subpatch=ex.subpatch,
+        )
+        assert recovered == ex.payload
 
 
 def test_generate_examples_corruption_prob_zero_is_always_clean():
@@ -229,9 +243,9 @@ def test_generate_examples_corruption_prob_one_is_never_clean():
 
 
 def test_generate_examples_target_survives_corruption():
-    """Even when the returned image IS corrupted, `target` still matches the clean, even-padded
-    encode of the same payload -- ground truth is never re-derived from the (possibly corrupted)
-    image."""
+    """Even when the returned image IS corrupted, `target` still matches the clean, aligned
+    (encode(..., align=2)) encode of the same payload -- ground truth is never re-derived from
+    the (possibly corrupted) image."""
     for ex in generate_examples(
         6, palettes=VALID_PALETTES, payload_sizes=(48,), seed=5, corruption_prob=1.0
     ):
@@ -242,8 +256,8 @@ def test_generate_examples_target_survives_corruption():
             nsym=ex.nsym,
             seed=0,
             subpatch=ex.subpatch,
+            align=2,
         )
-        clean_img = pad_to_even_patch_grid(clean_img, ex.patch_size, ex.palette)
         _, _, truth_symbols = extract_symbols(
             clean_img, palette=ex.palette, patch_size=ex.patch_size, subpatch=ex.subpatch
         )
@@ -257,8 +271,8 @@ def test_generate_examples_images_always_have_even_patch_grid():
     smart_resize requires to be a no-op; see heliogram/dataset.py's "PROCESSOR RESIZE HAZARD"
     module-docstring note). Exercises palettes (2, 4) specifically -- unlike DEFAULT_PALETTES
     (64/128/256, whose width is even by construction for this project's actual payload sizes),
-    small palettes commonly produce an ODD width (see pad_to_even_patch_grid's docstring), so
-    this is the case that actually exercises the column-padding branch, not just the row one."""
+    small palettes commonly produce an ODD natural width, so this is the case that actually
+    exercises encode(align=2)'s width rounding, not just the height rounding."""
     for ex in generate_examples(
         30,
         palettes=(2, 4, 8, 64, 128, 256),
@@ -694,11 +708,27 @@ def test_pad_sequences_noop_when_all_equal_length():
 
 def test_heliogram_vl_collator_constructs_without_torch():
     """HeliogramVLCollator must be constructible (and its non-__call__ surface introspectable)
-    without importing torch -- only __call__ing it on a real batch does. See its docstring."""
+    without importing torch -- only __call__ing it on a real batch does. The torch-was-not-
+    imported half runs in a fresh subprocess for the same order-independence reason as
+    test_import_heliogram_does_not_pull_in_torch above."""
     collator = train_qlora.HeliogramVLCollator(pad_token_id=0)
     assert collator.pad_token_id == 0
     assert collator.label_pad_token_id == -100
-    assert "torch" not in sys.modules
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); import train_qlora; "
+            "c = train_qlora.HeliogramVLCollator(pad_token_id=0); "
+            "assert c.label_pad_token_id == -100; "
+            "assert 'torch' not in sys.modules, 'constructing the collator imported torch'",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_pad_token_id_prefers_pad_token_falls_back_to_eos():
@@ -730,23 +760,57 @@ def test_pad_token_id_raises_without_either():
 # --- D3: scripts/train_qlora.py LoRA target modules (pure Python, no torch) ---------------------
 
 
-def test_lora_merger_target_modules_included_by_default():
-    targets = train_qlora._build_lora_target_modules(include_vision_blocks=False)
-    for module in train_qlora.LORA_TARGET_MODULES:
-        assert module in targets
-    for module in train_qlora.LORA_MERGER_TARGET_MODULES:
-        assert module in targets
-    for module in train_qlora.LORA_VISION_BLOCK_TARGET_MODULES:
-        assert module not in targets  # opt-in only, not included by default
+# _build_lora_target_modules returns a REGEX (peft: re.fullmatch per dotted module path), not a
+# suffix list -- a plain suffix list silently matched the vision blocks' SwiGLU MLPs too (peft
+# suffix-matches against the FULL path, and vision blocks contain gate_proj/up_proj/down_proj),
+# LoRA-tuning modules the docstring promised were opt-in. These tests exercise the regex with
+# fullmatch against REAL module paths (verified against a transformers-5.13 random-weight
+# Qwen2.5-VL's named_modules(); see also tests/test_train_qlora_lora_targets.py, which pins the
+# same facts against actual peft wrapping whenever torch/peft are installed).
+_LM_PATHS = [
+    "model.language_model.layers.0.self_attn.q_proj",
+    "model.language_model.layers.0.self_attn.k_proj",
+    "model.language_model.layers.0.self_attn.v_proj",
+    "model.language_model.layers.0.self_attn.o_proj",
+    "model.language_model.layers.1.mlp.gate_proj",
+    "model.language_model.layers.1.mlp.up_proj",
+    "model.language_model.layers.1.mlp.down_proj",
+]
+_MERGER_PATHS = ["model.visual.merger.mlp.0", "model.visual.merger.mlp.2"]
+_MERGER_NON_TARGETS = ["model.visual.merger.mlp.1"]  # the GELU between the two Linears
+_VISION_BLOCK_PATHS = [
+    "model.visual.blocks.0.attn.qkv",
+    "model.visual.blocks.0.attn.proj",
+    "model.visual.blocks.0.mlp.gate_proj",
+    "model.visual.blocks.0.mlp.up_proj",
+    "model.visual.blocks.0.mlp.down_proj",
+]
 
 
-def test_lora_vision_block_target_modules_only_with_flag():
-    targets = train_qlora._build_lora_target_modules(include_vision_blocks=True)
-    for module in train_qlora.LORA_VISION_BLOCK_TARGET_MODULES:
-        assert module in targets
-    # still includes the always-on sets too:
-    for module in train_qlora.LORA_TARGET_MODULES + train_qlora.LORA_MERGER_TARGET_MODULES:
-        assert module in targets
+def _fullmatch(pattern, path):
+    import re
+
+    return re.fullmatch(pattern, path) is not None
+
+
+def test_lora_default_regex_covers_lm_and_merger_but_never_vision_blocks():
+    pattern = train_qlora._build_lora_target_modules(include_vision_blocks=False)
+    assert isinstance(pattern, str)
+    for path in _LM_PATHS + _MERGER_PATHS:
+        assert _fullmatch(pattern, path), f"default regex must match {path}"
+    for path in _VISION_BLOCK_PATHS + _MERGER_NON_TARGETS:
+        assert not _fullmatch(pattern, path), (
+            f"default regex must NOT match {path} -- vision blocks are opt-in only "
+            "(--include-vision-blocks), and this exact leak is the bug the regex exists to fix"
+        )
+
+
+def test_lora_vision_block_regex_only_with_flag():
+    pattern = train_qlora._build_lora_target_modules(include_vision_blocks=True)
+    for path in _LM_PATHS + _MERGER_PATHS + _VISION_BLOCK_PATHS:
+        assert _fullmatch(pattern, path), f"opt-in regex must match {path}"
+    assert not _fullmatch(pattern, "model.visual.blocks.0.norm1")
+    assert not _fullmatch(pattern, "model.visual.patch_embed.proj")
 
 
 def test_train_qlora_cli_help_documents_include_vision_blocks_flag():

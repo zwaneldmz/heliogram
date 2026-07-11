@@ -12,11 +12,21 @@ Usage (on a GPU box with `pip install -e . -r requirements-gpu.txt` done):
         --corruptions clean,jpeg_q70 --n-train-images 6 --n-test-images 3 \\
         --out probe_report.md --json probe_report.json
 
-DATA HONESTY (mirrors heliogram/vlm.py's module docstring): everything torch/transformers in
-this file is UNTESTED against a real model in this repository -- there is no GPU here. The
-model-free half (labels, probe, verdicts, report) lives in heliogram/probe.py and IS tested
-(tests/test_probe.py), including an end-to-end synthetic-encoder run that exercises the exact
-label/token ordering this script relies on. Two loud guard rails protect the real run:
+DATA HONESTY (mirrors heliogram/vlm.py's module docstring): this file has never been run
+against real WEIGHTS in this repository -- there is no GPU and no HF Hub access here. But the
+model-INTERFACE contract it relies on (visual-tower attribute path, image-processor call and
+grid_thw output, visual() call signature, merged-token count and which output field carries the
+RASTER-ORDERED merged embeddings) is CPU-VERIFIED against transformers 5.13.0 using a tiny
+RANDOM-WEIGHT Qwen2.5-VL instantiated from a local config -- see
+tests/test_probe_contract_cpu.py, which runs this file's own _extract_embeddings/_cell_arrays
+end to end (random weights => probe at chance, contracts exercised for real). That test caught
+two run-blocking defects the first time it ran: `model.visual` does not exist in transformers
+5.x (`model.model.visual` does), and the tower returns BaseModelOutputWithPooling whose
+`pooler_output` -- NOT `last_hidden_state`, which is pre-merger and WINDOW-SHUFFLED -- holds
+the merged tokens. The model-free half (labels, probe, verdicts, report) lives in
+heliogram/probe.py and IS tested (tests/test_probe.py), including an end-to-end
+synthetic-encoder run that exercises the exact label/token ordering this script relies on. Two
+loud guard rails protect the real run:
  (1) an identity-preprocessing assertion -- if the processor's smart_resize touches the image
      (moving pixels off the symbol lattice), this script raises instead of measuring garbage;
  (2) the chance-level signature -- if the tower's token order differs from the raster-order
@@ -63,16 +73,84 @@ def _parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+def _resolve_visual_tower(model):
+    """The vision tower's attribute path moved across transformers versions: `model.visual` in
+    the 4.4x-era releases, `model.model.visual` in transformers 5.x (VERIFIED against
+    transformers 5.13.0 with a CPU-instantiated random-weight Qwen2.5-VL -- the top-level
+    `.visual` attribute simply does not exist there and the original `model.visual(...)` call
+    raised AttributeError; see tests/test_probe_contract_cpu.py). Resolve both, fail loudly on
+    neither."""
+    visual = getattr(model, "visual", None)
+    if visual is None:
+        inner = getattr(model, "model", None)
+        visual = getattr(inner, "visual", None) if inner is not None else None
+    if visual is None:
+        raise RuntimeError(
+            f"could not find the vision tower on {type(model).__name__}: neither `.visual` "
+            "(transformers 4.x layout) nor `.model.visual` (transformers 5.x layout) exists -- "
+            "check the installed transformers version's Qwen2.5-VL module layout."
+        )
+    return visual
+
+
+def _merged_embeddings_tensor(visual_out, expected_tokens: int):
+    """Extract the MERGED-token embedding matrix from whatever the visual tower returned.
+
+    transformers 5.x returns BaseModelOutputWithPooling where `pooler_output` holds the merged
+    tokens RESTORED TO RASTER ORDER (reverse_indices applied after the merger) and
+    `last_hidden_state` holds the pre-merger, WINDOW-SHUFFLED per-patch sequence -- reading
+    last_hidden_state would be silent garbage twice over (wrong granularity AND shuffled order).
+    Verified against transformers 5.13.0 source + a CPU tiny-model run (pooler_output shape ==
+    merged count, last_hidden_state shape == patch count). Older transformers returned the
+    merged tensor directly. Token count is checked in every branch; a mismatch raises rather
+    than measuring the wrong thing."""
+    import torch
+
+    if isinstance(visual_out, torch.Tensor):
+        emb = visual_out
+    else:
+        pooled = getattr(visual_out, "pooler_output", None)
+        last = getattr(visual_out, "last_hidden_state", None)
+        if pooled is not None and pooled.shape[0] == expected_tokens:
+            emb = pooled
+        elif last is not None and last.shape[0] == expected_tokens:
+            # A tower that returns merged states in last_hidden_state (no pooling field match).
+            emb = last
+        else:
+            shapes = {
+                "pooler_output": tuple(pooled.shape) if pooled is not None else None,
+                "last_hidden_state": tuple(last.shape) if last is not None else None,
+            }
+            raise RuntimeError(
+                f"visual tower returned {type(visual_out).__name__} with shapes {shapes}, "
+                f"but no field has the expected merged-token count {expected_tokens} -- "
+                "token-count contract violated; do not trust this run."
+            )
+    if emb.shape[0] != expected_tokens:
+        raise RuntimeError(
+            f"visual tower returned {emb.shape[0]} tokens, expected {expected_tokens} -- "
+            "token-count contract violated; do not trust this run."
+        )
+    return emb
+
+
 def _load_tower(model_id: str, device: str, dtype_name: str):
     """Load the full model once, keep only what the probe needs (the visual tower + processor).
-    UNTESTED against a real model in this repo -- see the module docstring."""
+    The load call itself is untested against real WEIGHTS in this repo (no HF Hub access/GPU
+    here), but the attribute layout, call signature, and output contract it relies on are
+    CPU-verified against transformers 5.13.0 -- see tests/test_probe_contract_cpu.py."""
     import torch
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
     dtype = getattr(torch, dtype_name)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_id, torch_dtype=dtype, device_map=device
-    )
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id, dtype=dtype, device_map=device
+        )
+    except TypeError:  # older transformers: the kwarg was torch_dtype
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id, torch_dtype=dtype, device_map=device
+        )
     model.eval()
     # Wide identity bounds: images from heliogram.dataset are already even-patch-grid (pixel
     # dims are exact multiples of 28 = patch*merge), so smart_resize with generous
@@ -99,17 +177,13 @@ def _extract_embeddings(model, processor, dtype, device: str, img) -> np.ndarray
             "fix min_pixels/max_pixels (see heliogram/dataset.py's PROCESSOR RESIZE HAZARD "
             "note) instead of measuring a corrupted channel."
         )
+    visual = _resolve_visual_tower(model)
     with torch.no_grad():
-        emb = model.visual(
+        visual_out = visual(
             out["pixel_values"].to(device=device, dtype=dtype),
             grid_thw=grid_thw.to(device),
         )
-    if emb.shape[0] != (exp_h // MERGE) * (exp_w // MERGE):
-        raise RuntimeError(
-            f"visual tower returned {emb.shape[0]} tokens, expected "
-            f"{(exp_h // MERGE) * (exp_w // MERGE)} for a {exp_w}x{exp_h} patch grid with a "
-            f"{MERGE}x{MERGE} merger -- token-count contract violated; do not trust this run."
-        )
+    emb = _merged_embeddings_tensor(visual_out, (exp_h // MERGE) * (exp_w // MERGE))
     return emb.float().cpu().numpy()
 
 

@@ -109,10 +109,17 @@ from heliogram.vlm import teacher_forced_symbol_accuracy  # noqa: E402 -- no hea
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # Standard QLoRA target-module set for Qwen2-VL/Qwen2.5-VL's language-model decoder stack:
-# attention projections + MLP projections ("attn/proj" from the handover). Module names are
-# UNVERIFIED here (no GPU to load the model and introspect `model.named_modules()`) -- they
-# match the module-naming convention transformers' Qwen2VL/Qwen2_5_VL implementations use as of
-# writing, but double-check against your installed transformers version before a real run.
+# attention projections + MLP projections ("attn/proj" from the handover). Module names
+# VERIFIED against transformers 5.13.0 by instantiating a random-weight Qwen2.5-VL from a local
+# config and walking `model.named_modules()` (see tests/test_train_qlora_lora_targets.py).
+#
+# MATCHING HAZARD (found by that same verification, fixed in _build_lora_target_modules): peft
+# matches a plain-string target_modules entry by SUFFIX against the full dotted module path, so
+# bare "gate_proj"/"up_proj"/"down_proj" also match every VISION BLOCK's SwiGLU MLP
+# (model.visual.blocks.N.mlp.gate_proj etc.) -- silently LoRA-tuning the vision tower that this
+# script's own docstring promises is opt-in only (--include-vision-blocks). That is why
+# _build_lora_target_modules composes these names into a REGEX anchored on `language_model`
+# rather than passing this list to LoraConfig directly.
 LORA_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
@@ -121,10 +128,11 @@ LORA_TARGET_MODULES = [
 # Vision merger MLP target modules (D3 of the Phase-2 scaffold review) -- INCLUDED BY DEFAULT in
 # LoRA fine-tuning, not opt-in. Qwen2-VL/Qwen2.5-VL's vision tower ends in a 2x2 spatial
 # patch-merger (`Qwen2VLPatchMerger`/`Qwen2_5_VLPatchMerger` in transformers' implementation as of
-# writing -- module path `visual.merger`) that projects each 2x2 block of raw ViT-patch embeddings
-# down to the single merged feature the language model actually sees; its own submodule names are
-# `mlp.0`/`mlp.2` (two nn.Linear layers around a GELU) -- UNVERIFIED here (no GPU to load the
-# model and introspect `model.named_modules()`), same caveat as LORA_TARGET_MODULES above.
+# writing -- module path `model.visual.merger` in transformers 5.x) that projects each 2x2 block
+# of raw ViT-patch embeddings down to the single merged feature the language model actually sees;
+# its own submodule names are `mlp.0`/`mlp.2` (two nn.Linear layers around a GELU) -- VERIFIED
+# against transformers 5.13.0 via a random-weight local-config Qwen2.5-VL's named_modules()
+# (tests/test_train_qlora_lora_targets.py), same verification as LORA_TARGET_MODULES above.
 #
 # WHY DEFAULT, NOT OPT-IN: this task is a PERCEPTION shift onto flat color grids surviving JPEG
 # corruption, not a language/reasoning shift -- fine-tuning ONLY the LM decoder (the pre-Slice-C
@@ -144,8 +152,8 @@ LORA_MERGER_TARGET_MODULES = ["mlp.0", "mlp.2"]
 # Full vision-BLOCK attention/MLP target modules -- opt-in only (`--include-vision-blocks`), NOT
 # part of the default target_modules. Qwen2.5-VL's vision transformer blocks
 # (`Qwen2_5_VLVisionBlock` as of writing) use `attn.qkv`/`attn.proj` for attention and a SwiGLU
-# MLP (`mlp.gate_proj`/`mlp.up_proj`/`mlp.down_proj`) per the model's technical report -- AGAIN
-# UNVERIFIED here (no GPU to introspect a real checkpoint's `model.named_modules()`), and a
+# MLP (`mlp.gate_proj`/`mlp.up_proj`/`mlp.down_proj`) per the model's technical report --
+# VERIFIED against transformers 5.13.0 the same way as the constants above, and a
 # meaningfully bigger, more speculative bet than the merger MLP above: fine-tuning the FULL vision
 # tower risks catastrophically forgetting whatever general-purpose visual features the tower
 # learned from its (almost certainly natural-photo-dominated) pretraining corpus, for a workload
@@ -167,17 +175,31 @@ LORA_VISION_BLOCK_TARGET_MODULES = [
 EVAL_SEED_OFFSET = 10_000_000
 
 
-def _build_lora_target_modules(include_vision_blocks: bool) -> List[str]:
-    """Assemble the full `target_modules` list for `LoraConfig` (D3 of the Phase-2 scaffold
-    review): the LM decoder stack (`LORA_TARGET_MODULES`) plus the vision merger MLP
-    (`LORA_MERGER_TARGET_MODULES`, always included), plus -- only when `include_vision_blocks` is
-    True (`--include-vision-blocks`) -- the full vision-block attention/MLP stack
-    (`LORA_VISION_BLOCK_TARGET_MODULES`). See those three constants' own docstrings/comments for
-    what each covers and why the merger is default-on while the full vision blocks are opt-in."""
-    target_modules = list(LORA_TARGET_MODULES) + list(LORA_MERGER_TARGET_MODULES)
+def _build_lora_target_modules(include_vision_blocks: bool) -> str:
+    """Assemble the `target_modules` REGEX for `LoraConfig` (D3 of the Phase-2 scaffold review):
+    the LM decoder stack (`LORA_TARGET_MODULES`, anchored on `language_model` -- see that
+    constant's MATCHING HAZARD note for why a plain suffix list silently also tuned the vision
+    blocks), plus the vision merger MLP (`LORA_MERGER_TARGET_MODULES`, always included), plus --
+    only when `include_vision_blocks` is True (`--include-vision-blocks`) -- the full
+    vision-block attention/MLP stack (`LORA_VISION_BLOCK_TARGET_MODULES`).
+
+    Returns a regex STRING (peft: `re.fullmatch` against each dotted module path) rather than a
+    suffix list. VERIFIED against transformers 5.13.0 + peft with a random-weight Qwen2.5-VL:
+    the default regex LoRA-wraps every language_model q/k/v/o/gate/up/down projection and
+    exactly the two merger Linear layers (visual.merger.mlp.0/.2), and ZERO vision-block
+    modules; the opt-in variant adds exactly the vision blocks' attn.qkv/attn.proj and SwiGLU
+    projections. See tests/test_train_qlora_lora_targets.py, which pins all of this."""
+    lm_alternatives = "|".join(LORA_TARGET_MODULES)
+    pattern = (
+        rf".*language_model.*\.({lm_alternatives})"
+        r"|.*visual\.merger\.mlp\.(0|2)"
+    )
     if include_vision_blocks:
-        target_modules += list(LORA_VISION_BLOCK_TARGET_MODULES)
-    return target_modules
+        vb_alternatives = "|".join(
+            name.replace(".", r"\.") for name in LORA_VISION_BLOCK_TARGET_MODULES
+        )
+        pattern += rf"|.*visual\.blocks\..*\.({vb_alternatives})"
+    return pattern
 
 
 @dataclass
@@ -487,19 +509,29 @@ def _load_model_and_processor(
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
-    model = ModelClass.from_pretrained(
-        base_model,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-    )
+    try:
+        model = ModelClass.from_pretrained(
+            base_model,
+            quantization_config=bnb_config,
+            device_map="auto",
+            dtype=torch.bfloat16,
+        )
+    except TypeError:  # older transformers: the kwarg was torch_dtype
+        model = ModelClass.from_pretrained(
+            base_model,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+        )
     processor = AutoProcessor.from_pretrained(base_model)
 
     lora_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules=list(target_modules),
+        # a regex STRING (re.fullmatch semantics), not a suffix list -- see
+        # _build_lora_target_modules for why (suffix matching silently tuned vision blocks)
+        target_modules=target_modules,
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
@@ -587,7 +619,10 @@ def _build_hf_dataset(manifest_path: Path, processor):
         return model_inputs
 
     ds = datasets.Dataset.from_list(records)
-    return ds.map(_load, remove_columns=ds.column_names)
+    # with_format("torch") is REQUIRED, not cosmetic: datasets.map serializes every tensor to
+    # Arrow lists, and HeliogramVLCollator calls .tolist() on the features it receives -- plain
+    # Python lists have no .tolist(), so without this the very first training batch crashes.
+    return ds.map(_load, remove_columns=ds.column_names).with_format("torch")
 
 
 def _evaluate_stage_per_symbol_accuracy(
