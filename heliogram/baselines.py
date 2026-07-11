@@ -15,6 +15,18 @@
 (c) rendered_text_density: a model-free, geometric estimate of how densely typeset text packs
     into the SAME patch grid unit the codec uses. The *true* bits/patch for rendered text needs
     actual OCR by an un-fine-tuned VLM -- that is Phase 2 work and is not done here.
+(d) measure_text_encoding_baselines / load_measured_text_baselines: the SAME measurement as (b)
+    but across MULTIPLE text encodings (base64, ascii85, base85, hex), persisted to
+    heliogram/data/text_baselines.json. Rationale: this project got burned once by an
+    under-measured baseline (the analytic 6.0 bits/token guess understated base64 by 35% and its
+    correction flipped every headline verdict -- see (b)); the SAME class of error is still live
+    as long as the bar is "base64" rather than "the strongest text encoding on the target
+    tokenizer". base64 is not optimal for BPE vocabularies -- ascii85/base85 pack 8 bits into
+    1.25 chars vs base64's 1.33, and BPE merge behavior differs per alphabet -- so the honest
+    economic bar is max(bits/token) over reasonable encodings, not base64 specifically.
+    `heliogram.harness` reports the strongest measured encoding alongside the base64 bar
+    whenever this file exists; absence of the file degrades to base64-only reporting (with the
+    caveat stated), never to a fabricated number.
 """
 
 from __future__ import annotations
@@ -27,7 +39,7 @@ import random
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -38,6 +50,12 @@ __all__ = [
     "MEASURED_BASELINE_PATH",
     "load_measured_baseline",
     "measure_base64_baseline",
+    "TEXT_ENCODINGS",
+    "EncodingMeasurement",
+    "MeasuredTextBaselines",
+    "MEASURED_TEXT_BASELINES_PATH",
+    "measure_text_encoding_baselines",
+    "load_measured_text_baselines",
     "RenderedTextDensity",
     "rendered_text_density",
 ]
@@ -327,6 +345,215 @@ def measure_base64_baseline(
     return result
 
 
+# --------------------------------------------------------------------------------------------
+# Multi-encoding text baselines: is base64 even the right bar? (see module docstring (d))
+# --------------------------------------------------------------------------------------------
+
+MEASURED_TEXT_BASELINES_PATH = Path(__file__).parent / "data" / "text_baselines.json"
+
+# Every candidate "ship bytes as text" encoding measured against the tokenizer. Values are
+# `bytes -> ascii str` callables. Deliberately conservative, standard-library-only choices --
+# exotic BPE-exploiting alphabets (base2048-style) are excluded on purpose: they are
+# tokenizer-specific tricks whose output is fragile to vocabulary changes, while the bar this
+# project needs is "what would a reasonable operator actually ship". If a future measurement
+# wants them, add the callable here and the whole pipeline picks it up.
+TEXT_ENCODINGS: Dict[str, "Callable[[bytes], str]"] = {
+    "base64": lambda b: base64.b64encode(b).decode("ascii"),
+    "ascii85": lambda b: base64.a85encode(b).decode("ascii"),
+    "base85": lambda b: base64.b85encode(b).decode("ascii"),
+    "hex": lambda b: b.hex(),
+}
+
+
+@dataclass
+class EncodingMeasurement:
+    """One text encoding's measured cost on one tokenizer: pooled across every (size, seed)
+    sample, same pooling convention as MeasuredBase64Baseline (total bits / total tokens, never
+    a mean of per-sample ratios)."""
+
+    encoding: str
+    bits_per_token: float
+    chars_per_token: float
+    tokens_per_kb: float
+
+
+@dataclass
+class MeasuredTextBaselines:
+    """Measured bits/token for EVERY encoding in TEXT_ENCODINGS on one tokenizer -- the artifact
+    `measure_text_encoding_baselines` writes and `load_measured_text_baselines` reads back.
+
+    `strongest` is the single number the rest of this project should treat as THE economic bar:
+    the encoding with the highest measured bits/token (i.e. the cheapest honest way to ship
+    bytes as text on this tokenizer). Bar-A-style comparisons against base64 alone understate
+    the true break-even whenever `strongest.encoding != "base64"` -- exactly the
+    adverse-direction baseline error the measured base64 baseline already caught once (see
+    MeasuredBase64Baseline's docstring); this artifact exists so it cannot recur silently.
+    """
+
+    tokenizer_id: str
+    tokenizer_package: str
+    sample_sizes: List[int]
+    seeds: List[int]
+    encodings: Dict[str, EncodingMeasurement]
+    measured_note: str = ""
+
+    @property
+    def strongest(self) -> EncodingMeasurement:
+        return max(self.encodings.values(), key=lambda e: e.bits_per_token)
+
+    @property
+    def note(self) -> str:
+        return self.measured_note
+
+
+def load_measured_text_baselines() -> Optional[MeasuredTextBaselines]:
+    """Load a previously-measured multi-encoding baseline from MEASURED_TEXT_BASELINES_PATH.
+    Returns None -- never raises -- when the file is missing or malformed, same soft-read
+    contract as `load_measured_baseline` (absence is an ordinary state: the measurement needs
+    transformers + HuggingFace Hub access, which not every environment has)."""
+    try:
+        raw = MEASURED_TEXT_BASELINES_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+        encodings = {
+            name: EncodingMeasurement(
+                encoding=str(rec["encoding"]),
+                bits_per_token=float(rec["bits_per_token"]),
+                chars_per_token=float(rec["chars_per_token"]),
+                tokens_per_kb=float(rec["tokens_per_kb"]),
+            )
+            for name, rec in data["encodings"].items()
+        }
+        if not encodings:
+            return None
+        return MeasuredTextBaselines(
+            tokenizer_id=str(data["tokenizer_id"]),
+            tokenizer_package=str(data["tokenizer_package"]),
+            sample_sizes=[int(s) for s in data["sample_sizes"]],
+            seeds=[int(s) for s in data["seeds"]],
+            encodings=encodings,
+            measured_note=str(data["measured_note"]),
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def measure_text_encoding_baselines(
+    tokenizer_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+    sizes: Sequence[int] = (1024, 4096, 16384),
+    seeds: Sequence[int] = (0, 1, 2),
+    write: bool = True,
+    tokenizer: object = None,
+) -> MeasuredTextBaselines:
+    """Measure bits/token for EVERY encoding in TEXT_ENCODINGS against a real tokenizer, using
+    byte-identical samples to `measure_base64_baseline` (same `random.Random(seed)` convention,
+    same sizes/seeds defaults) so the base64 row here and the dedicated base64 baseline can be
+    cross-checked against each other.
+
+    `tokenizer` may be passed directly (any object with `.encode(str) -> Sequence[int]`) --
+    used by tests, and by callers who already loaded one. When None, loads `tokenizer_id` via
+    transformers (raising RuntimeError with install instructions if transformers is missing --
+    never a fabricated fallback, same contract as measure_base64_baseline).
+
+    When `write=True`, persists to MEASURED_TEXT_BASELINES_PATH (JSON). heliogram.harness reads
+    that file (via load_measured_text_baselines) to report the strongest-text-encoding bar
+    alongside the base64 bar in RESULTS.md.
+    """
+    tokenizer_package = "caller-supplied tokenizer"
+    if tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "measure_text_encoding_baselines requires the 'transformers' package to load a "
+                f"real tokenizer ({tokenizer_id!r}). Install it with `pip install transformers` "
+                "and retry -- this function never falls back to an analytic guess under a "
+                "'measured' label (same contract as measure_base64_baseline)."
+            ) from exc
+
+        import transformers as _transformers_pkg
+
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        tokenizer_package = (
+            f"transformers=={getattr(_transformers_pkg, '__version__', 'unknown')}"
+        )
+
+    encode_fn = (
+        tokenizer.encode if hasattr(tokenizer, "encode") else tokenizer  # type: ignore[union-attr]
+    )
+
+    encodings: Dict[str, EncodingMeasurement] = {}
+    for name, to_text in TEXT_ENCODINGS.items():
+        total_bits = 0
+        total_tokens = 0
+        total_chars = 0
+        for size in sizes:
+            for seed in seeds:
+                rng = random.Random(seed)
+                sample_bytes = bytes(rng.getrandbits(8) for _ in range(size))
+                text = to_text(sample_bytes)
+                token_ids = encode_fn(text)
+                n_tokens = len(token_ids)
+                if n_tokens == 0:
+                    raise ValueError(
+                        f"tokenizer produced zero tokens for a {size}-byte {name} sample "
+                        f"(seed={seed}) -- refusing to divide by zero"
+                    )
+                total_bits += size * 8
+                total_tokens += n_tokens
+                total_chars += len(text)
+        encodings[name] = EncodingMeasurement(
+            encoding=name,
+            bits_per_token=total_bits / total_tokens,
+            chars_per_token=total_chars / total_tokens,
+            tokens_per_kb=total_tokens / (total_bits / 8 / 1024),
+        )
+
+    ranked = sorted(encodings.values(), key=lambda e: e.bits_per_token, reverse=True)
+    strongest = ranked[0]
+    result = MeasuredTextBaselines(
+        tokenizer_id=tokenizer_id,
+        tokenizer_package=tokenizer_package,
+        sample_sizes=list(sizes),
+        seeds=list(seeds),
+        encodings=encodings,
+        measured_note=(
+            f"measured: {tokenizer_id} tokenizer ({tokenizer_package}), "
+            f"{len(sizes)} sizes x {len(seeds)} seeds per encoding. bits/token ranking: "
+            + ", ".join(f"{e.encoding}={e.bits_per_token:.3f}" for e in ranked)
+            + f". STRONGEST: {strongest.encoding} at {strongest.bits_per_token:.4f} bits/token "
+            "-- this, not base64 specifically, is the honest text-context economic bar for "
+            "this tokenizer."
+        ),
+    )
+
+    if write:
+        MEASURED_TEXT_BASELINES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "tokenizer_id": result.tokenizer_id,
+            "tokenizer_package": result.tokenizer_package,
+            "sample_sizes": result.sample_sizes,
+            "seeds": result.seeds,
+            "encodings": {
+                name: {
+                    "encoding": e.encoding,
+                    "bits_per_token": e.bits_per_token,
+                    "chars_per_token": e.chars_per_token,
+                    "tokens_per_kb": e.tokens_per_kb,
+                }
+                for name, e in result.encodings.items()
+            },
+            "measured_note": result.measured_note,
+        }
+        MEASURED_TEXT_BASELINES_PATH.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    return result
+
+
 @dataclass
 class RenderedTextDensity:
     image: Image.Image
@@ -439,11 +666,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         result = measure_base64_baseline(
             tokenizer_id=args.tokenizer_id, sizes=tuple(args.sizes), seeds=tuple(args.seeds)
         )
-        print(f"measured bits/token: {result.bits_per_token:.4f}")
-        print(f"measured chars/token: {result.chars_per_token:.4f}")
+        print(f"measured base64 bits/token: {result.bits_per_token:.4f}")
+        print(f"measured base64 chars/token: {result.chars_per_token:.4f}")
         print(f"tokens/KB: {result.tokens_per_kb:.2f}")
         print(f"tokenizer: {result.tokenizer_id} ({result.tokenizer_package})")
         print(f"wrote: {MEASURED_BASELINE_PATH}")
+        # Same tokenizer, same samples, EVERY candidate text encoding (see module docstring
+        # (d)): base64 may not be the strongest way to ship bytes as text on this tokenizer,
+        # and the strongest one is the honest economic bar.
+        text = measure_text_encoding_baselines(
+            tokenizer_id=args.tokenizer_id, sizes=tuple(args.sizes), seeds=tuple(args.seeds)
+        )
+        print(text.measured_note)
+        print(f"wrote: {MEASURED_TEXT_BASELINES_PATH}")
         return 0
 
     existing = load_measured_baseline()
@@ -454,6 +689,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 1
     print(existing.note)
+    text_existing = load_measured_text_baselines()
+    if text_existing is None:
+        print(
+            f"no multi-encoding measurement found at {MEASURED_TEXT_BASELINES_PATH}; the "
+            "economic bar is being read off base64 alone, which may UNDERSTATE the true "
+            "text-context bar. Run with --measure to produce it."
+        )
+    else:
+        print(text_existing.measured_note)
     return 0
 
 
