@@ -406,22 +406,24 @@ def test_write_csv_includes_lm_token_columns(tmp_path):
 
 # --- _resolve_base64_baseline (B2): measured-baseline hook, defensive import -------------------
 #
-# heliogram.baselines.load_measured_baseline is being added to heliogram/baselines.py by a
-# PARALLEL work group and is NOT present in this worktree's checkout (confirmed by the first test
-# below) -- see harness._resolve_base64_baseline's docstring for why it is looked up via getattr
-# rather than a hard `from .baselines import load_measured_baseline`. These tests cover every
-# path through the resolver: (a) genuinely absent (today's reality in this worktree), falls back
-# to the analytic base64_bits_per_token(); (b) present but returns None (its own documented
-# "no measurement file found" case), also falls back; (c) present and returns a real object,
-# resolver must return THAT object unchanged -- the actual "hook" this review item asks for.
+# heliogram.baselines.load_measured_baseline is looked up via getattr rather than a hard
+# `from .baselines import load_measured_baseline` (see harness._resolve_base64_baseline's
+# docstring) so the harness keeps working against older checkouts of baselines.py that predate
+# the loader. These tests cover every path through the resolver: (a) attribute absent (an older
+# baselines.py), falls back to the analytic base64_bits_per_token(); (b) present but returns
+# None (its own documented "no measurement file found" case), also falls back; (c) present and
+# returns a real object, resolver must return THAT object unchanged -- the actual "hook" this
+# review item asks for.
 
 
-def test_resolve_base64_baseline_falls_back_to_analytic_when_load_measured_baseline_absent():
-    """Today's reality in this worktree: heliogram.baselines has no load_measured_baseline
-    attribute at all (the parallel work group's code is not present here). Confirmed directly,
-    then _resolve_base64_baseline must fall back to the always-available analytic
+def test_resolve_base64_baseline_falls_back_to_analytic_when_load_measured_baseline_absent(
+    monkeypatch,
+):
+    """With load_measured_baseline absent from heliogram.baselines (an older checkout of that
+    module -- simulated here by deleting the attribute, since the current checkout does define
+    it), _resolve_base64_baseline must fall back to the always-available analytic
     base64_bits_per_token() (6.0 bits/token) rather than raising AttributeError/ImportError."""
-    assert not hasattr(harness._baselines_module, "load_measured_baseline")
+    monkeypatch.delattr(harness._baselines_module, "load_measured_baseline", raising=True)
     result = harness._resolve_base64_baseline()
     assert result.bits_per_token == pytest.approx(6.0)
     assert not hasattr(result, "tokenizer_id")  # the analytic Base64Baseline has no such field
