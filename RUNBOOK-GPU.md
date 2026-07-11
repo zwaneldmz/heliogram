@@ -164,6 +164,48 @@ fine-tune has a credible shot and a retargeted P=16 curriculum is worth its ~$15
 stuck at ~13% → even the narrow case rests on a nonlinear readout the probe can't see —
 possible, but bet accordingly. (e) sets the max economical palette if (d) passes.
 
+### If (d)/(e) pass: the P=16 merger experiment
+
+`scripts/train_qlora.py` has a second curriculum builder,
+`build_p16_merger_curriculum()`, retargeted to exactly this narrow case — palette=16,
+`subpatch=1` throughout, never the dead `DEFAULT_PALETTES={64,128,256}` regime. Select it
+with `--curriculum p16_merger` (default stays `large_palette`, i.e. the original, now-dead
+`build_curriculum()`, kept only for back-compat):
+
+```bash
+python scripts/train_qlora.py --curriculum p16_merger \
+    --output-dir checkpoints/qwen25vl-heliogram-p16-merger-lora
+```
+
+- **VRAM/time expectation:** same as section 4 below — one modern GPU with ≥24GB VRAM,
+  tens of GPU-hours total across all stages (see `build_p16_merger_curriculum`'s own
+  docstring and the module-level docstring's hardware paragraph; this curriculum has
+  fewer, palette=16-only stages than the original, so expect the low end of that range).
+- The merger MLP (`visual.merger.mlp.0`/`.2`) is **already** in the default
+  `--target_modules` regardless of `--curriculum` — see `LORA_MERGER_TARGET_MODULES` and
+  `_build_lora_target_modules` — because tuning exactly that layer is the entire point of
+  this experiment: it is the layer the pre-merger/post-merger probe pair (13.4% vs.
+  65.5–73.6% symbol error, `docs/FINDINGS.md` section 3) measures to destroy the P=16
+  signal the vision blocks upstream still carry.
+- **Pre-committed decision rule:** per-stage held-out teacher-forced symbol accuracy
+  (printed by `_evaluate_stage_per_symbol_accuracy`, same mechanism as section 4) must
+  **beat 86.6%** (= 100% − the 13.4% pre-merger linear-probe symbol error from
+  `probe_report_premerger.md`) to show the fine-tune added value beyond what the frozen
+  tower already had pre-merger. A run that lands at or below 86.6% means the LoRA-tuned
+  merger + LM did no better than the frozen pre-merger embeddings already measured via a
+  cheap linear probe — i.e. the expensive fine-tune bought nothing a linear readout on
+  frozen weights didn't already show, and the answer is a negative result, not a partial
+  win to keep tuning around.
+- **The prize, restated, so it isn't oversold:** 4 palette=16 symbols per 2×2-merged LM
+  token = 16 bits/token, ≈1.9× the measured ascii85 text bar (8.374 bits/token,
+  `docs/FINDINGS.md` section 2) — modest, not transformative, and **unverified**: the
+  13.4% number is a linear-probe result on frozen weights, not evidence a LoRA-tuned
+  merger can actually get there.
+- This trains a machine-dense reader. Per the README's "Phase-2 safety release gate", any
+  adapter this run produces is governed by that gate before release — see section 5 below
+  (`measure_behavioral_capacity` + `foreign_tile.guard` TPR/FPR against the *tuned* model,
+  published together, before anything is released).
+
 ## 3. Optional: stock-model zero-shot floor (~30 min)
 
 Before fine-tuning, measure what the *unmodified* model does, so the fine-tune has a real
@@ -194,6 +236,13 @@ stock processor's ~1MP default budget silently downscales the larger grids — t
 measured corruption row (`qwen_smart_resize_1mp`) in RESULTS.md, not a hypothesis.
 
 ## 4. QLoRA fine-tune (only if step 2 passed; tens of GPU-hours)
+
+**This section describes the DEFAULT curriculum (`--curriculum large_palette`, i.e.
+`build_curriculum()` over `DEFAULT_PALETTES={64,128,256}`) — the original Slice C bet, which
+the session-2 verdict above measured DEAD (the vision blocks discard that much color depth
+before the merger ever runs). It is kept as the CLI default only for back-compatibility; do
+not run it expecting it to work. If you're here because (d)/(e) in section 2.5 passed, use
+the "If (d)/(e) pass" subsection above (`--curriculum p16_merger`) instead.**
 
 ```bash
 python scripts/train_qlora.py --output-dir checkpoints/qwen25vl-heliogram-lora

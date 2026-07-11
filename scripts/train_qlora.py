@@ -307,6 +307,128 @@ def build_curriculum(n_examples_per_stage: int = 2000) -> List[CurriculumStage]:
     ]
 
 
+# The two corruptions probe_report_premerger.md actually measured leaving usable pre-merger
+# signal at palette=16 (see build_p16_merger_curriculum's docstring for the numbers): "clean"
+# (13.4% pre-merger symbol error) and "jpeg_q70" (19.0%). Every OTHER entry in
+# DEFAULT_CORRUPTIONS is untested at this tap point/palette and is deliberately left out here --
+# spending this curriculum's corruption budget on corruptions nobody has measured a P=16
+# pre-merger signal for would dilute training toward an unmeasured claim. "clean" stays
+# included regardless of corruption_prob, same CurriculumStage contract as _HARD_CORRUPTION_NAMES
+# above (the "no corruption fired" branch looks it up unconditionally whenever
+# corruption_prob < 1.0).
+_P16_MEASURED_CORRUPTION_NAMES = {"clean", "jpeg_q70"}
+
+
+def build_p16_merger_curriculum(n_examples_per_stage: int = 2000) -> List[CurriculumStage]:
+    """The ONE narrow, GATED experiment the session-2 probe results (see RUNBOOK-GPU.md section
+    2.5's "Session-2 verdict" and docs/FINDINGS.md section 3) leave standing, after the original
+    Slice C bet (large-palette classification, `build_curriculum` above) was measured DEAD:
+
+      - `probe_report_premerger.md` measured the frozen, PRE-merger ViT-block output at
+        `palette=16` to carry a real, above-chance, partial linear signal: 13.4% probe symbol
+        error clean (vs. a 93.75% chance rate and a 6.27% Reed-Solomon decode budget), degrading
+        only modestly to 19.0% under `jpeg_q70`. `palette=256` at the same tap point was already
+        at/near chance (80.8% clean) -- the vision BLOCKS themselves discard that much color
+        depth before the merger ever runs, so no fine-tune downstream of them can recover it.
+        That is why this curriculum is PALETTE=16 ONLY, never the larger palettes
+        `build_curriculum` above targets.
+      - The SAME 16-color code that survives the vision blocks at 13.4% error is measured back
+        at 65.5-73.6% error (at/near chance again) once read POST-merger (`docs/FINDINGS.md`
+        section 3, `probe_report.md`/`probe_report_7b.md`) -- a ~5x error blow-up across exactly
+        one layer, the 2x2 patch-merger MLP. Pre-merger-preserved, post-merger-destroyed is the
+        textbook signature of a layer that is the bottleneck rather than a symptom of a bottleneck
+        further upstream, which is why this curriculum's whole reason to exist is to LoRA-tune
+        that specific layer (`LORA_MERGER_TARGET_MODULES`, already in the default `target_modules`
+        regardless of this curriculum choice -- see `_build_lora_target_modules`) rather than, say,
+        the LM decoder alone or the full vision-block stack.
+
+    THE PRIZE, if this works, is modest, not transformative: 4 palette=16 symbols folded into one
+    2x2-merged LM token is 4 symbols x 4 bits/symbol = 16 bits/merged-token, ~1.9x the measured
+    ascii85 text bar of 8.374 bits/token (`heliogram/data/text_baselines.json`,
+    `docs/FINDINGS.md` section 2) -- with Reed-Solomon exactness on top, if the fine-tune actually
+    gets there. That is the entire economic upside; this is not a rerun of the old ~7-bit/patch or
+    large-palette token-crossover claims, both of which are dead per `docs/FINDINGS.md`.
+
+    THIS FUNCTION DOES NOT CLAIM THE FINE-TUNE WILL WORK. The 13.4% pre-merger number is a LINEAR
+    probe result on FROZEN weights -- it shows the information exists somewhere in the pre-merger
+    representation for a linear readout to find, not that a LoRA-tuned merger can learn to
+    preserve it end to end, and not that the post-merger LM can then decode it either. It is also
+    gated on two cheap scans RUNBOOK-GPU.md section 2.5 lists as (d) (is 13.4% data-limited, or a
+    ceiling?) and (e) (does the pre-merger cliff sit strictly above palette=16?) -- this curriculum
+    is meant to be run only after those come back favorable, not as a substitute for them.
+
+    Curriculum shape: `palette=16`, `subpatch=1` in EVERY stage (never `DEFAULT_PALETTES` /
+    `build_curriculum`'s {64,128,256} -- that regime is measured dead at this tap point, see
+    above). A short clean warm-up (smallest payload only) is followed by stages that widen the
+    payload-size range across the amortization regime (128B/1024B/4096B -- small payloads pay a
+    fixed calibration/RS-parity overhead per grid; the wider range exercises how that overhead
+    amortizes, mirroring `build_curriculum`'s own payload-size choices) while `corruption_prob`
+    RISES stage over stage (0.0 -> 0.0 -> 0.3 -> 0.7, never decreasing) and every corrupted stage
+    draws ONLY from `_P16_MEASURED_CORRUPTION_NAMES` (`clean`/`jpeg_q70`) -- the two corruptions
+    `probe_report_premerger.md` actually measured a surviving P=16 pre-merger signal under, not
+    the full realistic-envelope suite `build_curriculum`'s stage4 uses (resize/`jpeg_q85`/
+    `combined` are untested at this palette/tap point and would dilute the curriculum's budget
+    toward an unmeasured claim).
+
+    Same caveat as `build_curriculum`: exact payload sizes/epoch counts/corruption_prob values
+    are a reasonable starting design, not the result of a sweep -- there is no GPU here to sweep
+    on.
+    """
+    p16_corruptions = {
+        name: fn
+        for name, fn in DEFAULT_CORRUPTIONS.items()
+        if name in _P16_MEASURED_CORRUPTION_NAMES
+    }
+    return [
+        CurriculumStage(
+            name="p16_stage1_warmup_clean",
+            n_examples=n_examples_per_stage,
+            palettes=[16],
+            subpatches=[1],
+            payload_sizes=[128],
+            corruption_prob=0.0,
+            epochs=1,
+            corruptions=p16_corruptions,
+        ),
+        CurriculumStage(
+            name="p16_stage2_clean_full_payload_range",
+            n_examples=n_examples_per_stage,
+            palettes=[16],
+            subpatches=[1],
+            payload_sizes=[128, 1024, 4096],
+            corruption_prob=0.0,
+            epochs=1,
+            corruptions=p16_corruptions,
+        ),
+        CurriculumStage(
+            name="p16_stage3_light_corruption",
+            n_examples=n_examples_per_stage,
+            palettes=[16],
+            subpatches=[1],
+            payload_sizes=[128, 1024, 4096],
+            corruption_prob=0.3,
+            epochs=2,
+            corruptions=p16_corruptions,
+        ),
+        CurriculumStage(
+            name="p16_stage4_heavier_corruption",
+            n_examples=n_examples_per_stage,
+            palettes=[16],
+            subpatches=[1],
+            payload_sizes=[128, 1024, 4096],
+            corruption_prob=0.7,
+            epochs=2,
+            corruptions=p16_corruptions,
+        ),
+    ]
+
+
+CURRICULUM_BUILDERS: Dict[str, Callable[[int], List[CurriculumStage]]] = {
+    "large_palette": build_curriculum,
+    "p16_merger": build_p16_merger_curriculum,
+}
+
+
 def _assert_processor_alignment(image: Any, patch_size: int) -> None:
     """Guard against Qwen's processor `smart_resize` silently resampling a heliogram grid OFF its
     symbol lattice (D4 of the Phase-2 scaffold review -- see heliogram/dataset.py's "PROCESSOR
@@ -768,6 +890,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="examples generated per curriculum stage (default: 2000)",
     )
     parser.add_argument(
+        "--curriculum",
+        choices=sorted(CURRICULUM_BUILDERS),
+        default="large_palette",
+        help="which curriculum builder to run (default: large_palette, i.e. build_curriculum(), "
+        "the original Slice C bet over DEFAULT_PALETTES -- kept as the default for backward "
+        "compatibility even though RUNBOOK-GPU.md's session-2 verdict measured it DEAD; "
+        "'p16_merger' selects build_p16_merger_curriculum(), the narrow palette=16 "
+        "merger-focused experiment the probes leave standing -- see that function's docstring "
+        "and RUNBOOK-GPU.md section 2.5 before choosing it, it is GATED on scans (d)/(e), not "
+        "a verified-to-work default)",
+    )
+    parser.add_argument(
         "--patch-size",
         type=int,
         default=PATCH_SIZE,
@@ -830,7 +964,8 @@ def main(argv: list = None) -> int:
         args.base_model, args.lora_rank, args.lora_alpha, args.lora_dropout, target_modules
     )
 
-    for stage in build_curriculum(args.n_examples_per_stage):
+    curriculum_builder = CURRICULUM_BUILDERS[args.curriculum]
+    for stage in curriculum_builder(args.n_examples_per_stage):
         print(f"=== curriculum stage: {stage.name} ===")
         stage_dataset_dir = Path(args.dataset_dir) / stage.name
         model = _train_stage(model, processor, stage, args, stage_dataset_dir)
