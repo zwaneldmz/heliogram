@@ -417,6 +417,14 @@ reader on the corruption axis too. Both benefit routes remain explicitly
 conditional on a learned reader; nothing model-based is claimed here.
 Phase 2 is GPU work and is **not** in this repo yet:
 
+- **Step 0 — the frozen-encoder linear probe (`scripts/run_probe.py`, single-digit GPU-hours,
+  runs BEFORE any training spend):** push heliogram grids through the stock, frozen Qwen2.5-VL
+  vision tower and train a linear probe from merged-token embeddings to the 4 patch symbols
+  each token covers (`heliogram/probe.py` — the model-free half is CPU-tested, including an
+  end-to-end synthetic-encoder rehearsal of the exact token-ordering contract). Probe error
+  at/below the RS budget on clean images ⇒ the information survives to the LM boundary and the
+  fine-tune only has to teach the LM to read it; probe at chance on clean images ⇒ the tower
+  discarded it and the LM-token branch dies for tens of dollars instead of a training run.
 - **Fine-tune an open VLM to decode heliogram images natively, retargeted at exactly the
   measured gaps above — in this order:** first the LM-token readout question at a
   corruption-proof palette (`palette=16`, `subpatch=1`: can the model read 4 easy symbols per
