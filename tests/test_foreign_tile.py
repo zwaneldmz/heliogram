@@ -30,9 +30,11 @@ from heliogram.instruments.foreign_tile import (
     DetectorEval,
     ForeignTileVerdict,
     build_eval_set,
+    build_texture_camouflage_positives,
     evaluate_detector,
     guard,
     is_foreign,
+    main as foreign_tile_main,
     patch_structure_score,
 )
 
@@ -299,3 +301,92 @@ def test_hard_positives_actually_fail_to_decode_under_every_allowlist_entry():
                     img, palette=entry.palette, patch_size=entry.patch_size, nsym=32,
                     subpatch=entry.subpatch,
                 )
+
+
+# --- texture-camouflage adversary: MEASURING the `# ponytail:` note's predicted ceiling ----------
+#
+# The `# ponytail:` note in is_foreign predicts a single global patch_structure_score threshold
+# cannot be robust to an adversary who deliberately shapes per-pixel texture. The tests below build
+# that exact adversary (build_texture_camouflage_positives) and MEASURE the result rather than just
+# asserting the prediction. Per this project's data-honesty rule, every number below was actually
+# produced by running this code this session -- see each test/comment for how to reproduce it, and
+# `python -m heliogram.instruments.foreign_tile` for the same numbers with full context.
+
+
+def test_build_texture_camouflage_positives_is_deterministic():
+    p1, a1 = build_texture_camouflage_positives(seed=0)
+    p2, a2 = build_texture_camouflage_positives(seed=0)
+    assert len(p1) == len(p2) == 4  # 2 families x n_per_family=2 (default)
+    assert a1 == a2
+    for imga, imgb in zip(p1, p2):
+        assert list(imga.getdata()) == list(imgb.getdata())
+
+
+def test_build_texture_camouflage_positives_different_seeds_differ():
+    p1, _ = build_texture_camouflage_positives(seed=0)
+    p2, _ = build_texture_camouflage_positives(seed=1)
+    same = all(
+        list(a.getdata()) == list(b.getdata())
+        for a, b in zip(p1, p2)
+        if a.size == b.size
+    )
+    assert not same
+
+
+def test_texture_camouflaged_tile_mechanism_defeats_patch_structure_score():
+    """MECHANISM-PROOF (not just the end-to-end is_foreign verdict): the noised tile itself must
+    score ABOVE DEFAULT_VAR_THRESHOLD -- this is exactly what lets it slip past is_foreign's step
+    (a) as "looks like a natural image", never even reaching the decode-attempt stage.
+
+    HONESTY NOTE on the amplitude: this module's task brief's suggested noise_amplitude=30 was
+    tried first and measured NOT to reliably clear DEFAULT_VAR_THRESHOLD=250.0 (observed scores
+    as low as ~144 for an off-allowlist-palette base tile at seed=0 -- comfortably under
+    threshold). noise_amplitude was raised to 50 (this module's actual default) and re-measured;
+    at 50 every positive build_texture_camouflage_positives(seed=0) produces clears the threshold
+    with margin (observed scores ~400-478, all > 250.0 -- see the four assertions below, one per
+    positive built at seed=0)."""
+    positives, _ = build_texture_camouflage_positives(seed=0)
+    assert len(positives) == 4
+    for img in positives:
+        score = patch_structure_score(img)
+        assert score > DEFAULT_VAR_THRESHOLD
+
+
+def test_texture_camouflage_family_tpr_collapses_at_bounded_fpr():
+    """THE headline finding this task set out to measure: the texture-camouflage adversary
+    collapses is_foreign's TPR, confirming (by direct measurement, not just restating) the
+    `# ponytail:` note's predicted ceiling on a single global variance threshold.
+
+    MEASURED (seed=0, DEFAULT_VAR_THRESHOLD, default allowlist {palette=8, palette=16},
+    build_eval_set's own negatives reused for a bounded-FPR apples-to-apples read against the
+    standard eval): tpr=0.0, fpr=0.0 over 4 texture-camouflaged positives (2 off-allowlist-palette
+    + 2 allow-listed-palette/shuffled-alphabet, each noised at noise_amplitude=50) and 16 negatives
+    (12 natural-ish + 4 allow-listed trusted tiles) -- reproduce via
+    `python -m heliogram.instruments.foreign_tile`. This is the OPPOSITE of the standard eval's
+    tpr=1.0 (see test_evaluate_detector_tpr_at_bounded_fpr_against_learned_alphabet_tiles above) at
+    the SAME fpr=0.0 -- the degradation is total, not partial, and is the HEADLINE result, not a
+    footnote. If this number ever changes (a change to patch_structure_score,
+    DEFAULT_VAR_THRESHOLD, is_foreign, build_eval_set's negatives, or
+    build_texture_camouflage_positives itself), re-run evaluate_detector and update this pinned
+    number honestly -- don't silently loosen or delete it.
+    """
+    _, negatives, allowlist = build_eval_set(seed=0)
+    texture_positives, texture_allowlist = build_texture_camouflage_positives(seed=0, allowlist=allowlist)
+    result = evaluate_detector(texture_positives, negatives, texture_allowlist)
+
+    assert result.n_positive == 4
+    assert result.n_negative == 16
+    assert result.tpr == pytest.approx(0.0)
+    assert result.fpr == pytest.approx(0.0)
+
+
+def test_foreign_tile_cli_main_prints_honest_reading_headline(capsys):
+    """Smoke test for the module's CLI: must run cleanly and print the HONEST READING headline
+    (not bury the texture-family TPR collapse as a footnote)."""
+    rc = foreign_tile_main([])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "HONEST READING" in out
+    assert "HEADLINE" in out
+    assert "Standard eval" in out
+    assert "Texture-camouflage family eval" in out
