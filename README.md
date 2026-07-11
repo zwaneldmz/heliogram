@@ -1,6 +1,6 @@
 # heliogram
 
-**If one ViT patch (~1 vision token) can reliably carry more than one text token's worth of data (~6 bits for base64), then encoded images are a cheaper context medium for self-hosted VLMs — heliogram measures whether that's true.**
+**If one ViT patch (~1 vision token) can reliably carry more than one text token's worth of data (8.096 bits for base64, measured on Qwen2.5-VL's tokenizer), then encoded images are a cheaper context medium for self-hosted VLMs — heliogram measures whether that's true. Measured answer so far: not per-patch (the codec's per-patch ceiling is 6.996 bits); the surviving route is multiple patch-symbols per merged LM token, which is Phase-2 work.**
 
 heliogram is a patch-aligned optical codec plus an evaluation harness. It encodes
 arbitrary bytes as a grid of solid-color 14x14 blocks (one symbol per ViT patch),
@@ -54,26 +54,36 @@ denser-than-text symbol coding, and we'll report it as such.
 > diagnostic stress test beyond this envelope are in
 > [`RESULTS.md`](RESULTS.md).
 
-**The honest headline, from the actual sweep:** at `palette=256`,
-`subpatch=1` (one symbol per patch — the only VLM-meaningful regime),
-heliogram beats base64 on both density (6.400 bits/patch clean at a 4KB
-payload, versus base64's ~6.0 bits/token — itself an analytic assumption,
-not yet a measured tokenizer value; see Baselines) *and* on raw token
-count (encoding a payload this way costs fewer total patches than
-base64-ing it into text tokens, from ~1.5KB payloads onward — exact scan:
-first crossing at 1537B, with slight staircase wobble up to ~1.6KB; see
-"Token crossover" below), and is bit-exact on a successful decode
-(Reed–Solomon-verified). **The open question is purely whether a
-fine-tuned VLM can read a 256-colour palette under real corruption — and
-on the model-free reference decoder measured here, it cannot:**
-`palette=256` clean-decodes exactly but is MEASURED to fail decode under
-JPEG q70 at *every* payload size this sweep tested (and, from 1KB up, even
-the milder JPEG q85); `palette=128` fails JPEG q70 from 1KB payloads up
-(its 48B cell now survives the full suite — that earlier failure was the
-decoder's unprotected length header, fixed in v0.2, not the channel). That
-failure is not a footnote — it is the entire reason this benefit is a
-Phase-2 bet and not a working result. See "Capacity sweep" and "Token
-crossover" below for the numbers.
+**The honest headline, from the actual sweep — and it changed when we
+measured the tokenizer:** against the MEASURED base64 baseline
+(Qwen2.5-VL's tokenizer: **8.096 bits/token**, 1.3498 base64 chars/token —
+BPE merges make base64 substantially cheaper than the naive 6.0-bits/token
+estimate this project originally compared against), **no `subpatch=1`
+config (one symbol per patch — the only VLM-meaningful regime) beats
+base64 on density or on token count, at any payload size, and none ever
+can on per-patch accounting:** the per-patch net ceiling is `log2(256) ×
+223/255 ≈ 6.996` bits/patch, strictly below the measured 8.096 bar, and
+the exact token-crossover scan finds no per-patch crossing up to 64KB
+(best ratio observed: 1.16 — 16% *more* tokens than base64). The earlier
+"beats base64 at 4KB" headline was an artifact of the unmeasured analytic
+baseline, and this paragraph is its correction, not its defense. **The
+surviving candidate benefit is the LM-token accounting:** Qwen2.5-VL's
+2×2 merger presents ~4× fewer LM tokens than ViT patches, under which
+heliogram crosses below base64 from tiny payloads (~50–130B, all
+palettes ≥8) — but that accounting carries an extra, UNVERIFIED
+assumption (that a model can read 4 symbols' worth of bits out of one
+merged embedding), the same epistemic class as the sub-patch caveat. So
+the project's open question has sharpened: not "can a VLM read 256
+colours under JPEG" but **"can a VLM read multiple patch-symbols through
+its own merger?"** — plus the measured fact (see the `bayes_bound`
+instrument) that at `palette=128` under pure JPEG q70 the information
+demonstrably survives in whole-patch statistics (oracle error 0.5%, 13×
+below the RS budget) even though the reference decoder fails there. On
+the reference decoder itself: `palette=256` fails JPEG q70 at every
+payload size (and q85 from 1KB up); `palette=128` fails q70 from 1KB up.
+Bit-exactness on successful decode (Reed–Solomon-verified) still holds
+everywhere. See "Capacity sweep" and "Token crossover" below for the
+numbers.
 
 Effective bits/patch = payload bits / total grid patches — TRUE payload
 density, with the calibration row, Reed–Solomon parity, framing, and grid
@@ -99,8 +109,9 @@ patch_size=14px, 3 trials/cell.
 | 128     | 7           | 1.500            | 1.500                 |
 | 256     | 8           | 0.750            | 0.536                 |
 
-The break-even line to beat is **~6 bits/patch** (the base64 baseline, see
-Baselines); at this small (48-byte) payload every palette here is below it,
+The break-even line to beat is **8.096 bits/patch** (the MEASURED base64
+baseline — see Baselines); at this small (48-byte) payload every palette
+here is far below it,
 including the two largest — this is a real result, not a failure to report:
 fixed overhead (32-byte RS parity + a calibration row that widens with the
 palette) is the bottleneck at 48 bytes, not palette size. For `palette` in
@@ -143,11 +154,14 @@ This project tracks three separate bars over that sweep, on purpose — see
 `RESULTS.md`'s Headline section for why conflating them is exactly the
 overclaiming this file exists to avoid:
 
-- **Bar A — beat base64 density, clean (6.0 bits/patch).** The real economic
-  break-even for density alone.
+- **Bar A — beat base64 density, clean (8.096 bits/patch, MEASURED
+  Qwen2.5-VL tokenizer; was 6.0 analytic until the measurement).** The real
+  economic break-even for density alone.
 - **Bar B — Gate #1 comfort margin (8.0 bits/patch, clean *and* worst-tested
-  corruption).** Deliberately padded above Bar A (see "Decision Gate" below)
-  — **not** the real economic bar.
+  corruption).** Originally padded above Bar A (see "Decision Gate" below) —
+  **note the measured Bar A (8.096) now sits ABOVE this fixed 8.0 bar, so
+  Gate #1 no longer functions as a comfort margin; clearing it is not
+  sufficient to beat measured base64 density.** Kept for continuity.
 - **Bar C — token crossover.** Does encoding a payload cost fewer total
   patches than base64-ing it into text tokens? An accounting comparison of
   token *count*, not bits/patch density — see below.
@@ -162,27 +176,30 @@ palette=8/subpatch=2 config now survives every corruption too (its earlier
 there (5.333) is below the bar — what it lacks at 48B is amortization, not
 robustness.
 
-**Bar A verdict: 25 of 64 configs beat base64 density clean — including,
-for the first time, `subpatch=1` configs:** `palette=128` at 16KB (6.066
-bits/patch) and `palette=256` at 4KB and 16KB (6.400 / 6.827 bits/patch).
-This is the real economic bar, and `subpatch=1`/`palette=256` clears it —
-but see the mandatory corruption caveat below before reading that as usable.
+**Bar A verdict against the MEASURED baseline: 18 of 64 configs beat base64
+density clean — every one of them `subpatch=2` (the pixel-decoder-only
+geometric regime). NO `subpatch=1` config clears it, and none ever can:**
+the per-patch net ceiling is `log2(256) × 223/255 ≈ 6.996` bits/patch,
+strictly below the measured 8.096 bar. (Under the earlier unmeasured 6.0
+analytic bar, `palette=256` at 4KB/16KB appeared to clear Bar A at
+6.400/6.827 — the measurement erased that margin; this is exactly the
+correction the measured baseline existed to force, reported as such.)
 
-**Bar C verdict — the actual currently-measured benefit claim: at
-`subpatch=1`, `palette=256` crosses below base64 token count at 1537B
-(exact byte-granular scan; the staircase wobbles back above 1.0 a few times
-up to ~1.6KB, then stays below), and `palette=128` crosses marginally at
-5569B (it hovers at the line, recrossing ≥1.0 dozens of times across the
-scanned 64KB — an unstable, at-the-margin win, not a threshold);
-`palette≤64` never crosses anywhere in the scanned range (up to 64KB).**
-Concretely, `palette=256` needs 5,120 total patches at a 4KB payload versus
-base64's ~5,464 estimated tokens for the same bytes (0.94×), improving to
-19,200 vs. ~21,848 (0.88×) at 16KB — fewer tokens *and* denser *and*
-bit-exact on a successful decode. (`RESULTS.md` now also reports a second,
-LM-token accounting for the pinned Phase-2 target's 2×2 patch merger
-(Qwen2.5-VL), under which crossovers happen ~4× earlier — clearly flagged
-there as carrying an extra, UNVERIFIED assumption: that a merged embedding
-can be read at 4× the per-patch symbol density.)
+**Bar C verdict against the MEASURED baseline: on per-patch accounting (~1
+token per ViT patch), NO `subpatch=1` palette crosses below base64 token
+count anywhere in the exact scan up to 64KB** — the best ratio observed is
+1.16 (`palette=256`, i.e. 16% MORE tokens than base64; under the old
+analytic ~1-char/token estimate it appeared to cross at 1537B — measuring
+the tokenizer erased that crossing too). Concretely: `palette=256` needs
+5,120 patches at a 4KB payload versus base64's measured ~4,048 tokens
+(1.26×). **The only accounting under which heliogram crosses is the
+LM-token one (Qwen2.5-VL's 2×2 merger: ~4× fewer LM tokens than patches),
+where all palettes ≥8 cross from ~50–130B payloads (e.g. `palette=256` at
+4KB: 1,280 LM tokens vs ~4,048 — 0.32×). That accounting carries an extra,
+UNVERIFIED assumption — that a model can read 4 patch-symbols' worth of
+bits out of ONE merged embedding — the same epistemic class as the
+sub-patch caveat, and it is now the entire load-bearing wall of the
+project's economic case.**
 
 **Honesty caveat (mandatory, same as `RESULTS.md`, and the whole reason Bar
 C is a bet and not a result): `palette=128`/`256` clean-decode exactly on
@@ -227,28 +244,26 @@ Two more things this sweep found, both measured (not cherry-picked):
   5.185; palette=256: 0.750 → 5.333 → 6.400 → 6.827 bits/patch, at
   48B/1KB/4KB/16KB) but asymptotically approaches `log2(palette) × 223/255`
   — it pays down the fixed per-message overhead, it cannot raise the
-  per-symbol ceiling itself. `palette=256` is the first palette whose
-  amortization curve crosses the base64 baseline (between 1KB and 4KB).
+  per-symbol ceiling itself. Against the measured 8.096 baseline no
+  `subpatch=1` amortization curve ever crosses (the `palette=256` asymptote
+  is 6.996); under the old analytic 6.0 bar it appeared to cross between
+  1KB and 4KB — that appearance did not survive measuring the tokenizer.
 
 Every number above is `decode_pixels` (pixel decoder, CPU, no VLM) — see the
 Scope note at the top of `RESULTS.md`.
 
 ## Baselines
 
-- **base64 in text context: ~6 bits/token.** base64 encodes 6 payload bits per
-  character, and common tokenizers emit roughly one token per base64 character.
-  **Honesty note: this is an ANALYTIC assumption, and its known error direction
-  is adverse to heliogram's claim** — BPE multi-char merges give base64 *more*
-  than 6 bits/token, and the measured Bar A margins above it are thin (7–14%).
-  `heliogram.baselines.base64_bits_per_token()` returns the 6.0 analytic figure
-  by default and accepts a HuggingFace tokenizer to measure the real ratio;
-  `python -m heliogram.baselines --measure` measures the pinned Phase-2 target
-  tokenizer (Qwen2.5-VL) and writes `heliogram/data/base64_baseline.json`,
-  which the harness then prefers over the analytic figure and reports as the
-  source of every Bar A verdict. Not yet run: this environment's network
-  policy blocks the HF Hub, so the measured file is absent and every current
-  verdict rests on the analytic 6.0 (stated in `RESULTS.md`'s Baselines
-  section).
+- **base64 in text context: 8.096 bits/token, MEASURED** (Qwen2.5-VL's
+  tokenizer, `transformers==5.13.0`, 9 samples across 1KB/4KB/16KB payloads;
+  committed as `heliogram/data/base64_baseline.json`, which the harness
+  prefers over the analytic figure and reports as the source of every Bar
+  A/Bar C verdict). The old ~6.0 analytic estimate (log2(64) per char at ~1
+  char/token) understated base64 by 35%: BPE merges give base64 1.3498
+  chars/token. **This single measurement is what killed the `subpatch=1`
+  per-patch economic claim above — exactly the adverse-direction error the
+  earlier honesty note here predicted.** `python -m heliogram.baselines
+  --measure` reproduces it (or measures a different tokenizer).
 - **Rendered text (honesty guardrail).** The obvious competitor is just
   typesetting the payload small and letting the VLM read it — that's what
   DeepSeek-OCR and Glyph exploit. `heliogram.baselines` typesets the payload onto
@@ -264,11 +279,13 @@ Scope note at the top of `RESULTS.md`.
   row + Reed–Solomon parity once per *image*, amortized differently as
   payload grows. `heliogram.harness._token_crossover` compares
   `total_patches` (the grid's width×height, ~1 token/patch for a self-hosted
-  VLM) directly against `base64_token_est` (`ceil(payload/3)*4`, ~1
-  token/char) for the SAME payload. Measured (exact byte-granular scan):
-  only `palette` 128/256 at `subpatch=1` currently cross that line —
-  `palette=256` at 1537B (stably below from ~1.6KB), `palette=128`
-  marginally at 5569B (hovers at the line).
+  VLM) directly against `base64_token_est` (`ceil(payload/3)*4` chars scaled
+  by the measured 1.3498 chars/token) for the SAME payload. Measured (exact
+  byte-granular scan, measured baseline): NO `subpatch=1` palette crosses on
+  per-patch accounting anywhere up to 64KB (best ratio 1.16 at
+  `palette=256`); the LM-token (2×2 merger) accounting crosses from
+  ~50–130B for all palettes ≥8, under its separately-flagged unverified
+  read-4-symbols-per-merged-token assumption.
 
 ## Quickstart
 
@@ -362,13 +379,15 @@ baselines. It answers one question — *how many bits does a patch carry through
 realistic preprocessing?*
 
 **Decision Gate #1:** Phase 2 starts only if the corrupted (worst-tested-case,
-not mean) bits/patch number clears a working bar of **~8 bits/patch** — a
-deliberate margin above the ~6 bit/token base64 break-even (Baselines above),
-not just any number over it. **This bar is a conservative comfort margin,
-not the real economic bar** — Bar A (beat base64 density, clean) and Bar C
-(token crossover) are the two bars this project's actual benefit claim rests
-on (see "Capacity sweep" above), and are reported alongside Gate #1 for
-exactly that reason, not as a replacement for it.
+not mean) bits/patch number clears a working bar of **~8 bits/patch** —
+originally a deliberate margin above the then-analytic ~6 bit/token base64
+break-even. **The measured baseline inverted that relationship: base64 is
+actually 8.096 bits/token (Baselines above), so the fixed 8.0 gate now sits
+BELOW the real economic bar and no longer functions as a comfort margin.**
+Bar A (beat measured base64 density, clean) and Bar C (token crossover) are
+the two bars this project's actual benefit claim rests on (see "Capacity
+sweep" above); Gate #1 is kept and reported for continuity, not as a
+sufficient condition for anything.
 
 The capacity/amortization/Gate sweep (see "Capacity sweep" above; full detail
 in `RESULTS.md`) found that **3 of the 64 tested (palette, subpatch,
@@ -382,25 +401,30 @@ palette, `P=256` — but Reed–Solomon/calibration overhead caps the achievable
 without bound, strictly below 8 for any finite payload (measured max in this
 sweep: 6.827, palette=256, 16KB).
 
-**That result does not, by itself, open or close this gate — but the sweep
-found something else that does motivate starting Phase 2 anyway: at
-`subpatch=1`, `palette=256` clears Bar A (beats base64 density clean, from
-4KB payloads: 6.400 bits/patch) and Bar C (crosses below base64 token count
-at 1537B, exact scan, stably below from ~1.6KB), and `palette=128` clears
-both too, marginally (Bar A only at 16KB, 6.066; Bar C hovering at the line
-from ~5.6KB).** This is the project's actual, currently-measured benefit
-signal — cheaper-than-text context for large binary payloads, bit-exact —
-**and it is explicitly conditional on a learned reader recovering it:
-`palette=128/256` are measured, on this same model-free decoder, to fail
-decode under JPEG q70 at every payload size where that benefit exists.**
+**Against the measured tokenizer baseline, the per-patch economic case for
+`subpatch=1` is closed — no density win is mathematically possible (ceiling
+6.996 < 8.096) and no token-count crossing exists in the scanned range. What
+still motivates Phase 2 is a different, sharper pair of measured facts:**
+(a) under **LM-token accounting** (Qwen2.5-VL's 2×2 merger, ~4× fewer LM
+tokens than ViT patches), every palette ≥8 crosses below base64 from
+~50–130B payloads — IF a model can read 4 patch-symbols through one merged
+embedding, which is unverified and is now the project's central question;
+and (b) the **`bayes_bound` instrument** measured that at `palette=128`
+under pure JPEG q70 the symbol information demonstrably survives in
+whole-patch statistics (Gaussian-oracle error 0.5% vs the ~6.3% RS budget)
+even though `decode_pixels` fails there — real headroom for a learned
+reader on the corruption axis too. Both benefit routes remain explicitly
+conditional on a learned reader; nothing model-based is claimed here.
 Phase 2 is GPU work and is **not** in this repo yet:
 
 - **Fine-tune an open VLM to decode heliogram images natively, retargeted at exactly the
-  measured gap above:** `palette` in `{64, 128, 256}` at `subpatch=1`, under corruption
-  augmentation concentrated on the specific corruptions (`jpeg_q70`/`jpeg_q85`/`combined`) this
-  same palette range is measured to fail — i.e. learned classification of a big color palette
-  through realistic corruption, *not* sub-patch geometry (`subpatch>1` stays a documented,
-  secondary, pixel-decoder-only geometric ceiling, unchanged from the discussion above). See
+  measured gaps above — in this order:** first the LM-token readout question at a
+  corruption-proof palette (`palette=16`, `subpatch=1`: can the model read 4 easy symbols per
+  merged token at all — the cheapest decisive experiment, isolating readout from color
+  robustness), then the corruption axis where `bayes_bound` measured real headroom
+  (`palette=128` under `jpeg_q70`/`jpeg_q85`), and only then `palette=256` (whose q70 cell the
+  same instrument measured as borderline-destroyed). Not sub-patch geometry (`subpatch>1` stays
+  a documented, secondary, pixel-decoder-only geometric ceiling, unchanged from above). See
   `heliogram/dataset.py`'s retargeted defaults (`DEFAULT_PALETTES`) and
   `scripts/train_qlora.py`'s retargeted curriculum (`build_curriculum()`) for where this plays
   out; `heliogram.vlm.QwenVLDecoder` (see "Phase 2 (GPU)" below) is the decoder plug point, and
