@@ -32,3 +32,12 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+      - name: Install fonts (for heliogram.typography's geometric packing check)
+        # heliogram/typography.py's _load_monospace_font deliberately refuses to fall back to a
+        # proportional font (see its docstring), so a real monospace TrueType font must be
+        # present for `make smoke` to reach heliogram.typography's model-free CLI check below.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+
+      - name: make smoke (model-free repro harness -- pytest + version-stable CLI invariants)
+        run: make smoke

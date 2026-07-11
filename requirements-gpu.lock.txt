@@ -1,0 +1,33 @@
+# Pinned GPU dependency lockfile -- companion to requirements-cpu.lock.txt for the Phase-2 (GPU)
+# scaffold (scripts/run_probe.py, scripts/train_qlora.py, scripts/train_merger_adapter.py,
+# heliogram.vlm.QwenVLDecoder). Mirrors requirements-gpu.txt's package set, pinned to specific
+# versions instead of loose lower bounds.
+#
+# *** UNTESTED IN THIS REPO -- NO GPU HERE. ***
+# Every version below is a reasonable, documented pin, NOT a verified-working combination: this
+# repo has no GPU, and none of these packages (nor the GPU code paths that import them) have ever
+# been run end to end against real weights here (see scripts/run_probe.py's and
+# scripts/train_merger_adapter.py's own module docstrings for the same caveat). Before trusting a
+# real training/probe run on GPU hardware, verify this combination actually works there first --
+# treat these pins as a documented starting point, not a certified-working lockfile.
+#
+# transformers==5.13.0 is pinned deliberately: it is the exact version every probe/vlm docstring
+# in this repo cites as what its GPU-side contract assumptions were verified against (see
+# scripts/run_probe.py, heliogram/vlm.py, tests/test_probe_contract_cpu.py,
+# tests/test_train_qlora_lora_targets.py) -- installing a different transformers version here
+# reopens exactly the "untested against a moved target" risk those docstrings warn about.
+#
+# Install alongside requirements-cpu.lock.txt (or `pip install -e .`), e.g.:
+#     pip install -r requirements-cpu.lock.txt -r requirements-gpu.lock.txt
+#     pip install -e .
+
+torch==2.5.1
+# transformers 5.x's Qwen2-VL image processor imports torchvision at module load (verified
+# against transformers 5.13.0) -- required even for the CPU-side processor call path.
+torchvision==0.20.1
+transformers==5.13.0
+peft==0.13.2
+bitsandbytes==0.44.1
+accelerate==1.1.1
+datasets==3.1.0
+qwen-vl-utils==0.0.8

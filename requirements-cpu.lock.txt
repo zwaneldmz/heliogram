@@ -1,0 +1,23 @@
+# Pinned CPU-only dependency lockfile -- reproduces the exact toolchain versions cited in
+# RESULTS.md's Provenance line (Python 3.12.3; numpy 2.1.2; Pillow 11.0.0; reedsolo 1.7.0), so
+# that anyone rebuilding from this file gets the SAME measurement environment the committed
+# RESULTS.md / results.csv / probe_report*.md numbers were produced under, not just "a recent
+# enough" version. Target interpreter: Python 3.12 (see Dockerfile).
+#
+# This lockfile is the CPU-only base package's dependency set (heliogram's pyproject.toml
+# `dependencies` + the `dev` extra's pytest) -- it deliberately does NOT include transformers,
+# torch, or any GPU package. `import heliogram` never needs any of those (see heliogram/vlm.py's
+# and heliogram/benefit.py's module docstrings on the CPU-only-by-default import boundary); the
+# model-free pytest suite and `scripts/smoke.sh` both run to completion on exactly this lockfile.
+#
+# Regenerate/verify by installing this file and diffing `pip freeze` against it; do not hand-edit
+# version numbers without re-checking them against RESULTS.md's Provenance line.
+
+numpy==2.1.2
+Pillow==11.0.0
+reedsolo==1.7.0
+
+# Test runner for `python -m pytest tests/ -q` / `make smoke` (mirrors pyproject.toml's `dev`
+# extra). Not pinned to the exact provenance patch version since RESULTS.md's Provenance line
+# does not name one; pinned to a known-good major.minor known to work with Python 3.12.
+pytest==8.3.3

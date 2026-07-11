@@ -1,0 +1,21 @@
+heliogram patches:         7424   (~1 self-hosted-VLM token/patch)
+base64 tokens:             8084   (~1 token/char, base64.b64encode)
+hex (raw-byte) tokens:    12124   (~1 token/char, payload.hex())
+patches / base64 tokens: 0.918x  (heliogram CHEAPER)
+patches / hex tokens:    0.612x  (heliogram CHEAPER)
+patches / raw text tokens: 4.900x  (raw text cheaper)
+heliogram patches:         7168   (~1 self-hosted-VLM token/patch)
+base64 tokens:             8000   (~1 token/char, base64.b64encode)
+hex (raw-byte) tokens:    12000   (~1 token/char, payload.hex())
+patches / base64 tokens: 0.896x  (heliogram CHEAPER)
+patches / hex tokens:    0.597x  (heliogram CHEAPER)
+  ASSUMPTION: assumed_symbol_error = 0.0627 (palette=2**8=256)
+  RS correction budget: 0.0627 (floor(32/2)/255)
+  recovered_bit_fraction: 1.0  (recovered_bits=48000 of payload_bits=48000)
+  tokens spent: 7168
+  cost per recovered bit: 0.149333 tokens/bit
+  ASSUMPTION: assumed_symbol_error = 0.9961 (palette=2**8=256)
+  RS correction budget: 0.0627 (floor(32/2)/255)
+  recovered_bit_fraction: 0.0  (recovered_bits=0 of payload_bits=48000)
+  tokens spent: 7168
+  cost per recovered bit: undefined (infinite) -- 0 bits recovered
