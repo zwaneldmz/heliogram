@@ -13,6 +13,16 @@ describes are modified here.
 
 ## 1. Summary
 
+heliogram's primary contribution is defensive-security tooling: a structural,
+model-free pre-ingest detector (`heliogram.instruments.foreign_tile`) for
+heliogram-like payloads, a written threat model (`docs/THREAT-MODEL.md`) for
+the covert-channel risk a capability-facing optical codec would pose, and a
+reusable pre/post-merger information-localization probe method — all shipped
+and measured independent of, and before, any capability-facing (fine-tuning)
+work (§4). The secondary question that motivated building those instruments
+in the first place was economic, and it is reported in full below, honestly,
+as a negative result: it does not become less true for being secondary.
+
 heliogram tested one economic hypothesis: that a patch-aligned optical codec —
 solid-color 14px blocks, one symbol per ViT patch, Reed–Solomon error
 correction — could pack more payload bits per vision token than base64/ascii85
@@ -101,6 +111,24 @@ codec's interaction with the target model's mandatory preprocessing — not
 merely a caveat, since it changed which configs clear the gate and shipped
 with a working fix.
 
+**Cost asymmetry and a conditional bit-cost.** Two further honest, model-free
+notes (`heliogram.benefit`, `python -m heliogram.benefit`). First, equal
+*token count* is not equal *compute cost*: an image token's merged embedding
+only exists after a full vision-tower forward pass and its own activation
+footprint, cost a same-length text prompt never pays, so the token-count
+comparisons above answer "how many tokens," never "how much compute"
+(`cost_asymmetry_points`, a structural argument with no invented FLOP or
+latency figure). Second, an assumption-gated *effective cost per recovered
+bit*: **if** a post-merger reader achieved the RS correction budget's own
+error rate (an optimistic anchor, never observed on any real reader), a
+6000-byte binary payload at `palette=256` costs 0.149 tokens per recovered
+bit (measured just now via `python -m heliogram.benefit`); at the
+chance-level error rate the probe (§3) actually measured post-merger, the
+same arithmetic returns an undefined (infinite) cost — zero bits recovered.
+This is a conditional projection under an assumption the stock tower does
+not realize, not a second economic result; §3's probe remains the real,
+measured verdict on the stock tower.
+
 ## 3. The mechanism, from the probes
 
 The harness above only measures a model-free reference pixel decoder — it
@@ -110,9 +138,13 @@ information as far as the language model. Phase-2 Step 0
 pushes heliogram grids through the stock, frozen Qwen2.5-VL vision tower and
 trains a linear probe from token embeddings to the ground-truth patch symbols.
 A probe at/below the Reed–Solomon symbol-error budget means the information
-survives to the point the probe reads from; a probe at chance means it did
-not, and no fine-tune of the layers downstream of that point can recover it
-(module docstring intent, echoed in every probe report's header).
+survives to the point the probe reads from; a probe at chance means no
+linearly-decodable signal survives to that point — not that no fine-tune of
+the layers downstream could recover it: a nonlinear or higher-capacity probe
+could differ (module docstring intent, echoed in every probe report's
+header; see §5's existing nonlinear-probe caveat, which this is consistent
+with, and `scripts/train_merger_adapter.py`, a scaffolded, not-yet-run test
+of exactly this question at the merger).
 
 Four probe runs are in the repo, at two tap points in the model (post the 2×2
 merger — the default report; and, in `probe_report_premerger.md`, before the
@@ -146,8 +178,10 @@ Reading this table with the two tap points side by side is the whole finding:
   real partial signal the vision blocks themselves preserve, that survives
   degrading only modestly under `jpeg_q70` (19.0%). At `palette=256` (8
   bits/symbol), pre-merger is already at/near chance (80.8% clean, 81.9%
-  jpeg_q70) — the vision blocks destroy this much finer color structure
-  themselves, before the merger ever runs.
+  jpeg_q70) — the linear probe finds no linearly-decodable trace of this much
+  finer color structure at the vision blocks themselves, before the merger
+  ever runs (linear-probe scope, per §5; a nonlinear readout at this tap point
+  is untested).
 - **The 2×2 merger MLP is what finishes off the palette=16 signal.** The same
   16-color code that survives the vision blocks at 13.4% error is back at
   65.5–73.6% error (still at/near chance) once read post-merger on 3B/7B. The
@@ -195,7 +229,22 @@ instruments deliberately *before* any capability-facing (fine-tuning) work —
   defeat the reference decoder's calibration-from-row-0 recovery) as the hard
   positive case — the module is explicit that this is a structural/decode-
   based classifier, not a learned one, and contains no model import at any
-  scope (`heliogram/instruments/foreign_tile.py` module docstring).
+  scope (`heliogram/instruments/foreign_tile.py` module docstring). Measured
+  against its standard hard-positive set: TPR=1.000 (8/8) at FPR=0.000
+  (0/16) (`python -m heliogram.instruments.foreign_tile`). **This detector's
+  own blind spot is now measured, not merely predicted:** a texture-
+  camouflage adversary — an otherwise-foreign tile dusted with seeded
+  per-pixel noise so its cells still average to the right color but clear
+  the cheap first filter's variance threshold — collapses that filter
+  completely, measured at TPR=0.000 (0/4) against the same FPR=0.000 (0/16)
+  negatives (`python -m heliogram.instruments.foreign_tile`, "texture-
+  camouflage family eval"). Every texture-camouflaged positive is, by
+  construction, still a heliogram-shaped payload nobody approved — it is
+  simply waved through by the cheap structural filter before ever reaching
+  the decisive decode-attempt stage. This is an honest, measured limitation
+  of this particular defensive instrument, not a hypothetical one; see
+  `docs/THREAT-MODEL.md` for the fuller adversarial framing this result
+  informs.
 - **`heliogram.instruments.injection_bench`** is the harness pointed at
   *behavioral* payloads (persona hijack, forced output schema, triggered tool
   call), split explicitly into two halves per the project's data-honesty
@@ -225,7 +274,9 @@ instruments deliberately *before* any capability-facing (fine-tuning) work —
   bounded FPR. The README is explicit that this is "a commitment about what
   gets published and what release is conditioned on, not a claim that we have
   already run it" — nothing in this repo has a GPU, so neither number has
-  been measured yet.
+  been measured yet. See `docs/THREAT-MODEL.md` for the fuller threat model
+  (attacker capabilities, assets, and where each instrument sits in the
+  pipeline) this release gate operationalizes.
 
 **Honestly:** the behavioral-attack capacity itself has **not** been
 measured — there is no tuned reader in this repo, and
@@ -247,7 +298,16 @@ a future model — not a demonstrated exploit.
 - A **fine-tuned** adversary — one that trains the vision tower or merger
   itself to preserve this structure, rather than reading frozen embeddings —
   is a different, unmeasured question; the probes only characterize what the
-  stock, frozen weights already preserve.
+  stock, frozen weights already preserve. The cheapest version of that
+  question — can training only the merger (ViT and LM left frozen) recover
+  the `palette=16` signal the merger is measured to erase — is now DESIGNED
+  and staged as a refuse-without-model scaffold (`scripts/train_merger_adapter.py`:
+  Design A, a frozen-feature nonlinear readout diagnostic; Design B, an
+  actual trainable-merger LoRA/adapter gate), reusing the probe's exact
+  window-shuffle alignment code and re-checking against the committed
+  `probe_report_premerger.md` numbers before trusting anything new. It has
+  **not been run** — no GPU exists in this environment — so the merger-only
+  go/no-go remains open, scoped to Qwen2.5-VL, `palette=16` only.
 - A **different code** (different palette design, different patch geometry,
   a learned encoding rather than a hand-designed one) could interact with the
   vision blocks and merger differently; nothing here bounds codes not tested.
@@ -312,3 +372,11 @@ tuned model decodes (not only tiles the reference pixel decoder decodes), and
 apply the pre-committed decision rule to the result. That run requires a GPU
 this environment does not have and a fine-tuned reader that does not exist
 yet; it is out of scope for this document and is not performed here.
+
+A cheaper, intermediate step already exists to gate whether that full run is
+even worth its cost: `scripts/train_merger_adapter.py`'s Design A/Design B
+merger-only go/no-go (§5, above) would settle whether a trainable merger can
+recover the `palette=16` signal the frozen merger is measured to erase,
+before spending the tens-of-GPU-hours a full behavioral fine-tune curriculum
+would cost. It is designed and staged, refuses without a model, and has not
+been run.

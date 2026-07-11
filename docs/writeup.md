@@ -17,9 +17,10 @@ the operator controls preprocessing, making bits/patch and bits/token directly c
 independent channels were measured, and both came back negative. The color codec's own
 error-correction-adjusted ceiling, 6.996 bits/patch, sits below the measured text baseline
 (ascii85, 8.374 bits/token); frozen-tower linear probes on real Qwen2.5-VL weights (3B, 7B) show
-the model's patch-merger step destroys the fine symbolic structure the codec needs, even where
-the vision blocks upstream partially preserve it. A typography pivot — rendering the payload as
-dense typeset ascii85 text, the kind of input VLM towers demonstrably do read (DeepSeek-OCR,
+the model's patch-merger step leaves no linearly-decodable trace of the fine symbolic structure
+the codec needs, even where the vision blocks upstream partially preserve it linearly (a
+nonlinear probe was not tested and could differ — Section 7). A typography pivot — rendering the
+payload as dense typeset ascii85 text, the kind of input VLM towers demonstrably do read (DeepSeek-OCR,
 Glyph) — passes its geometric gate but fails a zero-shot OCR readability measurement: font sizes
 the tower reads accurately sit roughly 4x below the economic bar in density, and sizes dense
 enough to beat the bar are illegible. Both failures trace to one mechanism: optical compression
@@ -144,9 +145,13 @@ its blocks run and undoes it after the merger; the pre-merger probe recovers thi
 directly from the tower's own outputs by exact row-matching (no private `transformers` internals),
 failing loudly if the recovered index set is not a valid permutation (`scripts/run_probe.py`). A
 probe at or below the RS symbol-error budget (~6.27% for `nsym=32`) means the information survives
-to that tap point; a probe at chance means it does not, and no further fine-tuning downstream can
-recover what was already discarded upstream (`heliogram/probe.py`) — the reason a clean-image FAIL
-is treated as close to conclusive.
+to that tap point; a probe at chance means no linearly-decodable signal survives there — not that
+no fine-tune of downstream layers could recover it (`heliogram/probe.py`) — the reason a
+clean-image FAIL is treated as close to conclusive for the linear-readout question specifically.
+Whether a *trained* merger could do better is a different, open question; `scripts/train_merger_adapter.py`
+scaffolds exactly that test (Design A: frozen-feature nonlinear readout; Design B: a trainable
+merger LoRA/adapter), reusing this probe's own alignment code, but has not been run against real
+weights (Section 7).
 
 **Typography geometric gate and zero-shot OCR readability** (`heliogram/typography.py`,
 `heliogram/ocr_eval.py`, `scripts/run_typography_ocr.py`). `heliogram.typography` first checks,
@@ -198,6 +203,18 @@ read four patch-symbols out of one 2×2-merged token — an explicitly unverifie
 README calls "the entire load-bearing wall of the project's economic case." Section 4.2 reports
 the direct measurement against it.
 
+Two further honest, model-free notes bound even the token-count claim above (`heliogram.benefit`,
+`python -m heliogram.benefit`). First, equal token *count* is not equal compute *cost*: reaching a
+merged image token at all requires routing pixels through the frozen vision tower's own forward
+pass and activation footprint, a cost a same-length text prompt never pays — a structural argument,
+no FLOP or latency figure invented (`cost_asymmetry_points`). Second, an assumption-gated
+*effective cost per recovered bit*: assuming, optimistically, a post-merger reader that hit exactly
+the RS correction budget's own error rate, a 6000-byte binary payload at `palette=256` would cost
+0.149 tokens per recovered bit (measured live via `python -m heliogram.benefit`); at the
+chance-level error rate Section 4.2's probe actually measured post-merger, the same arithmetic
+returns an undefined (infinite) cost. This is a conditional projection under an assumption the
+stock tower does not realize, not a second measured result — Section 4.2 remains the real verdict.
+
 ### 4.2 Probe mechanism: post- and pre-merger localization
 
 Four probe runs, two tap points, two model sizes, committed at the repo root:
@@ -223,8 +240,9 @@ Pre-merger splits by palette. At `palette=16` (4 bits/symbol), pre-merger error 
 above the RS budget, so not directly decodable via a linear readout, but "far below chance": a
 real partial signal the vision blocks preserve, degrading only modestly under `jpeg_q70` (19.0%).
 At `palette=256` (8 bits/symbol), pre-merger is already at/near chance (80.8% clean, 81.9%
-`jpeg_q70`) — the vision blocks destroy this finer color structure themselves, before the merger
-runs. Comparing tap points at `palette=16` isolates the loss: the same code at 13.4% error
+`jpeg_q70`) — the linear probe finds no linearly-decodable trace of this finer color structure at
+the vision blocks themselves, before the merger runs (linear-probe scope; see Section 7).
+Comparing tap points at `palette=16` isolates the loss: the same code at 13.4% error
 pre-merger is back at 65.5–73.6% post-merger — the 2×2 merger MLP erases most of the
 linearly-recoverable signal the blocks upstream still held. The lowest-bit-depth codes
 (`palette=2`/`4`) leave a comparable partial-but-undecodable signal even post-merger
@@ -263,9 +281,11 @@ over natural images and typeset text, not a general-purpose lossless channel for
 symbolic structure. The color codec's pre/post-merger split shows this directly: the vision
 blocks partially tolerate coarse, out-of-distribution color structure (13.4% error at
 palette=16) but progressively discard finer color depth (80.8% at palette=256, same tap point),
-and whatever survives the blocks is then substantially destroyed by the 2×2 merger MLP — whose
-job is to compress four patch embeddings into one, with no particular reason to preserve
-fine-grained per-patch identity. Typography fails differently: the tower's OCR competence extends
+and whatever linearly-decodable trace survives the blocks is then, per the linear probe, mostly
+gone once read post the 2×2 merger MLP — whose job is to compress four patch embeddings into
+one, with no particular reason to preserve fine-grained per-patch identity. Whether a nonlinear
+readout or a trained merger would do better is untested here (Section 7). Typography fails
+differently: the tower's OCR competence extends
 to rendered text, but only at font sizes large enough to be comfortably legible, and legibility
 and packing density move in opposite directions as font size shrinks.
 
@@ -298,7 +318,18 @@ face the decisive second check — does the image decode under a trusted `(palet
 subpatch)` config. `evaluate_detector` reports TPR at a bounded FPR, using "learned-alphabet"
 tiles (data cells repainted through a permuted palette, built to defeat calibration-from-row-0
 recovery) as hard positives. It contains no model import at any scope — a structural/decode-based
-classifier, not a learned one, by design.
+classifier, not a learned one, by design. Measured against that standard hard-positive set:
+TPR=1.000 (8/8) at FPR=0.000 (0/16) (`python -m heliogram.instruments.foreign_tile`).
+
+That measurement also exposes this detector's own blind spot, directly rather than by prediction: a
+texture-camouflage adversary — an otherwise-foreign tile dusted with seeded per-pixel noise so its
+cells still average to the correct color but clear the cheap first filter's variance threshold —
+collapses that filter completely, measured at TPR=0.000 (0/4) against the same FPR=0.000 (0/16)
+negatives (`python -m heliogram.instruments.foreign_tile`, "texture-camouflage family eval"). Every
+texture-camouflaged positive is, by construction, still a heliogram-shaped payload nobody approved
+— it is simply waved through by the cheap structural filter before ever reaching the decisive
+decode-attempt stage. This is a measured limitation of this particular defensive instrument, not a
+hypothetical one; see `docs/THREAT-MODEL.md` for the fuller adversarial framing this result feeds.
 
 `heliogram.instruments.injection_bench` addresses a harder question: if a payload decodes cleanly
 under a *trusted* config, can its bytes still carry an instruction that changes downstream model
@@ -320,7 +351,8 @@ payloads survive corruption at rates the guard cannot catch at bounded FPR.
 
 **Stated honestly:** behavioral-attack capacity has not been measured. There is no tuned reader in
 this repo, and `measure_behavioral_capacity` refuses to run without one. What exists is a threat
-model, a structural detector with a measured methodology against its defined hard-positive case,
+model (`docs/THREAT-MODEL.md`), a structural detector with a measured methodology against its
+defined hard-positive case (and a measured blind spot against a texture-camouflage adversary, above),
 and a benchmark harness ready for a future model — not a demonstrated exploit.
 
 ## 7. Limitations
@@ -330,12 +362,21 @@ and a benchmark harness ready for a future model — not a demonstrated exploit.
   capacity: a nonlinear probe, or one with more capacity or data, could recover more at the same
   tap point.
 - A **fine-tuned** adversary that trains the tower or merger itself to preserve this structure is
-  unmeasured; the probes only characterize what stock, frozen weights preserve. The one gated,
-  live experiment that would test this — a merger-retargeted fine-tune at `palette=16`
-  (`build_p16_merger_curriculum` in `scripts/train_qlora.py`, `--curriculum p16_merger`) — is
-  designed and CPU-contract-tested but not run against real weights; it is gated on two cheap
-  pre-scans (data-limitedness of the 13.4% pre-merger error, and mapping the pre-merger palette
-  cliff between 16 and 256) that are also unrun (`RUNBOOK-GPU.md` §2.5).
+  unmeasured; the probes only characterize what stock, frozen weights preserve. A cheaper,
+  intermediate go/no-go for exactly this question — can training only the merger (tower and LM
+  left frozen) recover the `palette=16` signal the frozen merger is measured to erase —
+  is scaffolded in `scripts/train_merger_adapter.py`: Design A, a frozen-feature nonlinear readout
+  diagnostic (no gradients into the tower at all); Design B, the actual gate, LoRA/adapter-training
+  the merger jointly with a readout head. Both reuse the probe's own window-shuffle alignment code,
+  refuse to run without a real model, and re-check against the committed `probe_report_premerger.md`
+  numbers before trusting anything new — neither has been run against real weights (no GPU here).
+  The larger, one gated, live experiment that would test the full fine-tune question — a
+  merger-retargeted fine-tune at `palette=16` (`build_p16_merger_curriculum` in
+  `scripts/train_qlora.py`, `--curriculum p16_merger`) — is designed and CPU-contract-tested but
+  not run against real weights; it is gated on two cheap pre-scans (data-limitedness of the 13.4%
+  pre-merger error, and mapping the pre-merger palette cliff between 16 and 256) that are also
+  unrun (`RUNBOOK-GPU.md` §2.5). In practice, the cheaper `train_merger_adapter.py` gate is meant
+  to run before that larger curriculum is attempted at all.
 - A **different code** (palette design, patch geometry, a learned encoding) could interact with
   the vision blocks and merger differently; nothing here bounds untested codes.
 - Every claim is specific to **Qwen2.5-VL** (3B/7B, `transformers==5.13.0`); nothing transfers to
