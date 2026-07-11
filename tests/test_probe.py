@@ -220,3 +220,85 @@ def test_end_to_end_real_grids_synthetic_encoder_reads_symbols_back():
     fit = fit_linear_probe(X_tr, y_tr, X_te, y_te, n_classes=palette, seed=0, epochs=60)
     assert fit.symbol_error < 0.01
     assert fit.n_test_positions > 0
+
+
+# --- scripts/run_probe.py CLI (torch-free): --probe-head / --model-arch refusing stubs,
+# --help ------------------------------------------------------------------------------------
+#
+# scripts/run_probe.py imports numpy and heliogram modules at top level but keeps torch/
+# transformers imports function-local (see its module docstring) -- so importing the module or
+# calling its argument-parsing/registry helpers must work here, in an environment with no torch
+# installed at all. These tests would fail loudly (ModuleNotFoundError) if that invariant were
+# ever broken by an errant top-level `import torch`.
+
+
+def _load_run_probe():
+    """Import scripts/run_probe.py by file path, the same way
+    tests/test_probe_contract_cpu.py does, so these guard tests don't need a package install."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "run_probe", repo_root / "scripts" / "run_probe.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("run_probe", mod)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_run_probe_help_works_without_torch():
+    """`--help` must stay usable with no torch/transformers installed -- a hard repo invariant.
+    Run it as a real subprocess (not an in-process import) so this is a genuine check of the
+    file as executed, not just of import order within this test process."""
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [_sys.executable, str(repo_root / "scripts" / "run_probe.py"), "--help"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--probe-head" in result.stdout
+    assert "--model-arch" in result.stdout
+
+
+def test_probe_head_default_is_linear():
+    rp = _load_run_probe()
+    args = rp._parse_args([])
+    assert args.probe_head == "linear"
+
+
+def test_probe_head_mlp_raises_before_any_model_or_torch_work():
+    """--probe-head mlp is a designed refusing stub (Task 1, empirical): main() must raise
+    NotImplementedError itself, before _load_tower and before any torch/transformers import --
+    this test runs with no torch installed, so any attempt to import it would fail the test for
+    the wrong reason if the guard didn't fire first."""
+    rp = _load_run_probe()
+    with pytest.raises(NotImplementedError, match="probe-head mlp"):
+        rp.main(["--probe-head", "mlp", "--palettes", "16", "--corruptions", "clean"])
+
+
+def test_unknown_model_arch_raises_unverified_registry_guard():
+    """A --model-arch outside TOWER_REGISTRY must refuse rather than silently falling back to
+    Qwen2.5-VL's interface contract -- both directly and via main(), before _load_tower/torch."""
+    rp = _load_run_probe()
+    with pytest.raises(NotImplementedError, match="tower-family registry"):
+        rp._resolve_tower_arch("some_other_vlm")
+    with pytest.raises(NotImplementedError, match="tower-family registry"):
+        rp.main(["--model-arch", "some_other_vlm", "--palettes", "16", "--corruptions", "clean"])
+
+
+def test_default_model_arch_is_the_verified_qwen_entry():
+    rp = _load_run_probe()
+    assert rp.DEFAULT_ARCH == "qwen2_5_vl"
+    entry = rp._resolve_tower_arch(rp.DEFAULT_ARCH)
+    assert entry["verified"] is True
+    # every other registered entry (if any get added later) must be marked unverified until it
+    # earns its own CPU contract test -- guard the invariant, not just today's single entry.
+    unverified = [name for name, e in rp.TOWER_REGISTRY.items() if not e.get("verified")]
+    assert rp.DEFAULT_ARCH not in unverified

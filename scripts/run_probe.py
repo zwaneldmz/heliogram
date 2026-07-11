@@ -22,12 +22,25 @@ TWO PROBE STAGES (--probe-stage):
                     but not at `merged` means the merger MLP destroys the symbols, and
                     scripts/train_qlora.py's default merger-LoRA has a concrete, targeted job;
                     unreadable even here means the vision BLOCKS already discarded flat-color
-                    identity and no merger/LM tuning can recover it -- stop.
+                    identity such that no LINEARLY-DECODABLE per-patch signal survives even at
+                    this earlier tap point -- a higher-capacity/nonlinear probe could still
+                    differ (untested; see docs/FINDINGS.md Section 5 and --probe-head mlp, a
+                    designed refusing stub) -- treat as strong evidence to stop, not proof.
                     Window-order unshuffling is recovered from the tower's own outputs by
                     exact row-matching (no private transformers imports); every ordering link
                     is CPU-verified in tests/test_probe_contract_cpu.py, including that
                     re-running the tower's merger on the unshuffled states reproduces
                     pooler_output exactly.
+
+STUBS THAT REFUSE RATHER THAN FABRICATE (both fire in main(), before any model/torch import):
+  --probe-head {linear,mlp}   linear (default) is the measured, current behavior. mlp is the
+                              TODO(GPU) nonlinear-probe experiment (Task 1, empirical) -- NOT
+                              implemented; raises a NotImplementedError explaining why (see
+                              docs/FINDINGS.md Section 5).
+  --model-arch ARCH           selects a TOWER_REGISTRY entry (Task 3, GPU stub); defaults to
+                              "qwen2_5_vl", the only VERIFIED entry. Any other/unknown value
+                              raises rather than silently reusing Qwen2.5-VL's interface
+                              contract for an unverified tower family.
 
 DATA HONESTY (mirrors heliogram/vlm.py's module docstring): this file has never been run
 against real WEIGHTS in this repository -- there is no GPU and no HF Hub access here. But the
@@ -70,10 +83,77 @@ from heliogram.probe import evaluate_cell, format_report, merged_token_labels
 
 MERGE = 2  # Qwen2.5-VL spatial merger: 2x2 ViT patches -> 1 LM-visible token
 
+DEFAULT_ARCH = "qwen2_5_vl"
+
+# Tower-family registry (Task 3, GPU stub): generalizing this script to a NON-Qwen vision-
+# language tower is meant to be a DATA change here -- a new dict entry naming the model class,
+# processor class, candidate visual-tower attribute paths, and merge factor -- not a code fork of
+# _load_tower/_resolve_visual_tower. Only "qwen2_5_vl" is VERIFIED: its model class, processor,
+# and `.visual`/`.model.visual` attribute paths are exercised end-to-end against a real (tiny,
+# random-weight) transformers Qwen2.5-VL in tests/test_probe_contract_cpu.py. Any other entry --
+# including ones a future contributor adds here -- is refused by `_resolve_tower_arch` until it
+# earns the same CPU-contract coverage; this repo does not claim to have verified an
+# architecture's interface contract just because someone typed a plausible-looking registry row.
+TOWER_REGISTRY = {
+    "qwen2_5_vl": {
+        "description": "Qwen2.5-VL (3B/7B/72B-Instruct etc.) -- the only architecture this repo "
+                       "has ever probed, and the only one CPU-contract-tested.",
+        "model_module": "transformers",
+        "model_class": "Qwen2_5_VLForConditionalGeneration",
+        "processor_module": "transformers",
+        "processor_class": "AutoProcessor",
+        "visual_attrs": ("visual", "model.visual"),
+        "merge": MERGE,
+        "verified": True,  # tests/test_probe_contract_cpu.py exercises this entry end-to-end
+    },
+}
+
+
+def _resolve_tower_arch(arch: str) -> dict:
+    """Look up a tower-family registry entry by name. Pure Python -- no torch/transformers
+    import -- so this guard fires (and is CPU-testable) even where those packages aren't
+    installed. TODO(GPU): adding support for a new architecture belongs here, as a new
+    TOWER_REGISTRY entry, not as a fork of _load_tower/_resolve_visual_tower's code; but a new
+    entry does not become trustworthy just by existing -- until it has CPU-contract coverage
+    like tests/test_probe_contract_cpu.py gives "qwen2_5_vl", it stays unverified and this
+    function refuses it rather than silently reusing Qwen2.5-VL's interface contract."""
+    entry = TOWER_REGISTRY.get(arch)
+    if entry is None:
+        raise NotImplementedError(
+            f"--model-arch {arch!r} is not in the tower-family registry (known: "
+            f"{sorted(TOWER_REGISTRY)}) -- TODO(GPU): generalizing to a new tower family means "
+            "adding a TOWER_REGISTRY entry (model class, processor, visual-tower attribute "
+            "candidates, merge factor) here in scripts/run_probe.py, not forking _load_tower's "
+            "code. This run refuses rather than guessing at an unregistered arch's interface "
+            "contract (attribute layout, output fields) by reusing Qwen2.5-VL's."
+        )
+    if not entry.get("verified", False):
+        raise NotImplementedError(
+            f"--model-arch {arch!r} is registered but UNVERIFIED: unlike 'qwen2_5_vl', it has "
+            "never been exercised against transformers' actual module layout, not even a CPU "
+            "tiny-random-weight run (see tests/test_probe_contract_cpu.py, which is what "
+            "verifies 'qwen2_5_vl'). TODO(GPU): add the equivalent CPU contract test for this "
+            f"arch ({entry.get('description', arch)}) before trusting a real run against it -- "
+            "this refuses now rather than silently assuming its attribute paths and output "
+            "contract happen to match Qwen2.5-VL's."
+        )
+    return entry
+
 
 def _parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model-id", default="Qwen/Qwen2.5-VL-3B-Instruct")
+    ap.add_argument("--model-arch", default=DEFAULT_ARCH,
+                    help="tower-family registry key (Task 3, GPU stub); default is the only "
+                    "VERIFIED entry, Qwen2.5-VL. Any other value -- unknown or registered but "
+                    "unverified -- raises before any model/torch work; see TOWER_REGISTRY and "
+                    "_resolve_tower_arch above. Not restricted to argparse `choices` so the "
+                    "guard's own message (not argparse's generic one) is what fires.")
+    ap.add_argument("--probe-head", default="linear", choices=["linear", "mlp"],
+                    help="linear (default): the measured, committed probe (heliogram.probe."
+                    "fit_linear_probe) -- current behavior, unchanged. mlp: TODO(GPU) nonlinear-"
+                    "probe experiment (Task 1, empirical) -- NOT implemented; raises before any "
+                    "model/torch work rather than fabricating a result.")
     ap.add_argument("--palettes", default="16,128,256",
                     help="comma-separated; default runs the README's Phase-2 order")
     ap.add_argument("--corruptions", default="clean,jpeg_q85,jpeg_q70",
@@ -91,31 +171,38 @@ def _parse_args(argv=None):
                     "states at the merger's INPUT (1 symbol per row) -- the LOCALIZATION run: "
                     "readable here but not at 'merged' means the merger MLP destroys the "
                     "symbols (and merger-LoRA has a concrete target); unreadable even here "
-                    "means the vision blocks already discarded them and no merger/LM tuning "
-                    "can recover it.")
+                    "means no LINEARLY-DECODABLE per-patch signal survives even at this "
+                    "earlier tap point (a nonlinear probe could still differ; untested).")
     ap.add_argument("--out", default="probe_report.md")
     ap.add_argument("--json", dest="json_out", default=None)
     return ap.parse_args(argv)
 
 
-def _resolve_visual_tower(model):
+def _resolve_visual_tower(model, visual_attrs=("visual", "model.visual")):
     """The vision tower's attribute path moved across transformers versions: `model.visual` in
     the 4.4x-era releases, `model.model.visual` in transformers 5.x (VERIFIED against
     transformers 5.13.0 with a CPU-instantiated random-weight Qwen2.5-VL -- the top-level
     `.visual` attribute simply does not exist there and the original `model.visual(...)` call
     raised AttributeError; see tests/test_probe_contract_cpu.py). Resolve both, fail loudly on
-    neither."""
-    visual = getattr(model, "visual", None)
-    if visual is None:
-        inner = getattr(model, "model", None)
-        visual = getattr(inner, "visual", None) if inner is not None else None
-    if visual is None:
-        raise RuntimeError(
-            f"could not find the vision tower on {type(model).__name__}: neither `.visual` "
-            "(transformers 4.x layout) nor `.model.visual` (transformers 5.x layout) exists -- "
-            "check the installed transformers version's Qwen2.5-VL module layout."
-        )
-    return visual
+    neither.
+
+    `visual_attrs` is an optional override (dotted attribute paths, tried in order) so a
+    TOWER_REGISTRY entry for a different arch (Task 3, GPU stub) can supply its own candidates
+    without forking this function; the default is exactly the two paths this file has always
+    checked, so every existing caller's behavior is unchanged."""
+    for path in visual_attrs:
+        obj = model
+        for part in path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return obj
+    raise RuntimeError(
+        f"could not find the vision tower on {type(model).__name__}: none of attribute path(s) "
+        f"{visual_attrs} exist -- check the installed transformers version's module layout (or, "
+        "for a non-Qwen --model-arch, that TOWER_REGISTRY entry's visual_attrs)."
+    )
 
 
 def _merged_embeddings_tensor(visual_out, expected_tokens: int):
@@ -258,36 +345,49 @@ def _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units: int)
     return units[reverse].reshape(seq_len, hidden), pooled, reverse
 
 
-def _load_tower(model_id: str, device: str, dtype_name: str):
+def _load_tower(model_id: str, device: str, dtype_name: str, arch: str = DEFAULT_ARCH):
     """Load the full model once, keep only what the probe needs (the visual tower + processor).
     The load call itself is untested against real WEIGHTS in this repo (no HF Hub access/GPU
     here), but the attribute layout, call signature, and output contract it relies on are
-    CPU-verified against transformers 5.13.0 -- see tests/test_probe_contract_cpu.py."""
+    CPU-verified against transformers 5.13.0 -- see tests/test_probe_contract_cpu.py.
+
+    `arch` (Task 3, GPU stub) selects a TOWER_REGISTRY entry; it defaults to "qwen2_5_vl", the
+    only VERIFIED entry, so every existing caller (positional 3-arg form) gets exactly the prior
+    hardcoded Qwen2.5-VL behavior. `_resolve_tower_arch` raises before any import here if `arch`
+    is unknown or registered-but-unverified -- main() also calls it earlier still, before this
+    function, so the guard fires without needing torch/transformers installed at all."""
+    import importlib
+
     import torch
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+    entry = _resolve_tower_arch(arch)
+    model_cls = getattr(importlib.import_module(entry["model_module"]), entry["model_class"])
+    processor_cls = getattr(
+        importlib.import_module(entry["processor_module"]), entry["processor_class"]
+    )
 
     dtype = getattr(torch, dtype_name)
     try:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id, dtype=dtype, device_map=device
-        )
+        model = model_cls.from_pretrained(model_id, dtype=dtype, device_map=device)
     except TypeError:  # older transformers: the kwarg was torch_dtype
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=dtype, device_map=device
-        )
+        model = model_cls.from_pretrained(model_id, torch_dtype=dtype, device_map=device)
     model.eval()
     # Wide identity bounds: images from heliogram.dataset are already even-patch-grid (pixel
     # dims are exact multiples of 28 = patch*merge), so smart_resize with generous
     # min/max_pixels is the identity. The per-image assertion below is the real guard.
-    processor = AutoProcessor.from_pretrained(
+    processor = processor_cls.from_pretrained(
         model_id, min_pixels=28 * 28, max_pixels=16_000_000
     )
     return model, processor, dtype
 
 
-def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = "merged") -> np.ndarray:
+def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = "merged",
+                        visual_attrs=("visual", "model.visual")) -> np.ndarray:
     """One image -> float32 numpy embeddings for the requested probe stage. Asserts identity
     preprocessing: the processor's reported patch grid must equal the image's own 14px grid.
+
+    `visual_attrs` (Task 3, GPU stub) is forwarded to `_resolve_visual_tower`; its default is
+    that function's own default (the Qwen 4.x/5.x paths), so every existing caller is unchanged.
 
     stage="merged" (default): (n_merged_tokens, out_hidden) POST-merger embeddings, raster
     order -- what the LM actually sees; one row per 2x2 merge unit, 4 symbols per row.
@@ -296,7 +396,10 @@ def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = 
     LOCALIZATION stage: if symbols are linearly readable here but not at "merged", the merger
     MLP (which scripts/train_qlora.py LoRA-tunes by default) is what destroys them and a
     targeted fine-tune has a concrete target; if they are unreadable even here, the vision
-    blocks themselves discarded the information and no merger/LM tuning can recover it."""
+    blocks themselves discarded the information: no LINEARLY-DECODABLE per-patch signal
+    survives even at this earlier tap point (a higher-capacity/nonlinear probe run at the same
+    tap point could still differ -- untested here; see docs/FINDINGS.md Section 5 and
+    --probe-head mlp, a designed refusing stub)."""
     import torch
 
     out = processor.image_processor(images=[img.convert("RGB")], return_tensors="pt")
@@ -310,7 +413,7 @@ def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = 
             "fix min_pixels/max_pixels (see heliogram/dataset.py's PROCESSOR RESIZE HAZARD "
             "note) instead of measuring a corrupted channel."
         )
-    visual = _resolve_visual_tower(model)
+    visual = _resolve_visual_tower(model, visual_attrs)
     n_units = (exp_h // MERGE) * (exp_w // MERGE)
     pixel_values = out["pixel_values"].to(device=device, dtype=dtype)
     grid_thw = grid_thw.to(device)
@@ -366,14 +469,34 @@ def _cell_arrays(model, processor, dtype, device, palette, corruption_name, corr
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
+
+    # --- guards: both fire here, before _load_tower, before torch/transformers ever import ---
+    if args.probe_head == "mlp":
+        raise NotImplementedError(
+            "--probe-head mlp is the TODO(GPU) nonlinear-probe experiment (Task 1, empirical) "
+            "-- NOT implemented. The probe this repo ships and has measured "
+            "(heliogram.probe.fit_linear_probe) is a plain-numpy LINEAR softmax readout; it "
+            "measures LINEAR readability of the frozen tower's embeddings only. A "
+            "higher-capacity, NONLINEAR probe (an MLP head) run at the SAME tap point could "
+            "still recover more signal than a linear readout does, without changing which "
+            "conclusion is warranted at the linear-probe level (see docs/FINDINGS.md Section 5, "
+            "'Honest limitations': the linear probe is a documented capacity bound, not a "
+            "ceiling). Running that experiment needs a GPU and real Qwen2.5-VL weights, neither "
+            "of which is present in this environment -- this is a designed, refusing stub: it "
+            "raises before touching any model rather than fabricating an MLP result. Use "
+            "--probe-head linear (the default) for the measured result."
+        )
+    _resolve_tower_arch(args.model_arch)  # raises early (pure Python) on unknown/unverified arch
+
     palettes = [int(p) for p in args.palettes.split(",") if p]
     corruption_names = [c.strip() for c in args.corruptions.split(",") if c.strip()]
     unknown = [c for c in corruption_names if c not in CORRUPTIONS]
     if unknown:
         raise SystemExit(f"unknown corruption(s) {unknown}; choose from {list(CORRUPTIONS)}")
 
-    print(f"loading {args.model_id} ({args.dtype}, device={args.device}) ...", flush=True)
-    model, processor, dtype = _load_tower(args.model_id, args.device, args.dtype)
+    print(f"loading {args.model_id} ({args.dtype}, device={args.device}, "
+          f"arch={args.model_arch}) ...", flush=True)
+    model, processor, dtype = _load_tower(args.model_id, args.device, args.dtype, args.model_arch)
 
     cells = []
     for palette in palettes:
@@ -395,7 +518,11 @@ def main(argv=None) -> int:
                   f"chance {cell.chance_error:.4f}) -> {cell.verdict}", flush=True)
             cells.append(cell)
 
-    report = format_report(cells, model_id=f"{args.model_id} [probe-stage={args.probe_stage}]")
+    report = format_report(
+        cells,
+        model_id=f"{args.model_id} [arch={args.model_arch} probe-stage={args.probe_stage} "
+                 f"probe-head={args.probe_head}]",
+    )
     Path(args.out).write_text(report)
     print(f"\nwrote {args.out}")
     if args.json_out:

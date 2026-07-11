@@ -9,9 +9,15 @@ the merged-token embeddings still LINEARLY separate the four patch symbols each 
   error at or below the Reed-Solomon budget, `rs_symbol_error_budget`), the information survives
   to the LM boundary and a fine-tune only has to teach the language model to READ what is
   already there -- the QLoRA bet is de-risked before a single training-hour is spent.
-- If the probe cannot separate the symbols ON CLEAN IMAGES, no LoRA on top of the same frozen
-  tower can conjure information the embedding already discarded -- the LM-token accounting
-  branch of the project (see RESULTS.md's "LM-token accounting" caveat) is dead, cheaply.
+- If the probe cannot separate the symbols ON CLEAN IMAGES, no LINEARLY-DECODABLE per-patch
+  signal survives to this tap point for a LoRA on top of the same frozen tower to exploit
+  linearly -- the LM-token accounting branch of the project (see RESULTS.md's "LM-token
+  accounting" caveat) is unsupported by this (linear) probe, cheaply. A higher-capacity,
+  NONLINEAR probe run at the same tap point could still recover something a linear readout
+  misses (see docs/FINDINGS.md Section 5, "Honest limitations") -- that experiment is not run
+  here (see scripts/run_probe.py's `--probe-head mlp`, a designed refusing stub), so treat a
+  clean-image FAIL as strong negative evidence, not proof that no computation downstream could
+  ever extract the symbols.
 
 DATA HONESTY (same rules as everywhere in this repo):
 - This module is the model-FREE half: label bookkeeping, the linear probe itself (plain numpy,
@@ -22,8 +28,10 @@ DATA HONESTY (same rules as everywhere in this repo):
 - A probe PASS is evidence about the ENCODER's embeddings, not a demonstration that the full VLM
   (LM decoding included) can transcribe grids -- that is what the subsequent QLoRA run measures.
   A probe FAIL on clean images, however, is close to conclusive in the negative direction for
-  this tower: linear non-separability with oracle labels leaves a fine-tune of the (frozen)
-  tower's consumers nothing to work with.
+  this tower: linear non-separability with oracle labels means no LINEARLY-DECODABLE per-patch
+  signal survives to this tap point for a LINEAR fine-tune head of the (frozen) tower's
+  consumers to work with -- a higher-capacity/nonlinear probe could still differ (untested here;
+  see docs/FINDINGS.md Section 5).
 - Token-order assumption: `merged_token_labels` lays labels out in raster order over the merged
   grid (row-major, top-left to bottom-right), matching Qwen2.5-VL's documented merger output
   order. If a tower ordered tokens differently, the probe would score at CHANCE level even on
@@ -270,9 +278,10 @@ class ProbeCellReport:
             )
         else:
             self.verdict = (
-                "at/near chance -- embeddings do not linearly separate the symbols here "
-                "(if this happens on CLEAN images, check the token-order assumption first, "
-                "then treat the LM-token branch as unsupported for this tower)"
+                "at/near chance -- no LINEARLY-DECODABLE per-patch signal survives to this tap "
+                "point (if this happens on CLEAN images, check the token-order assumption "
+                "first, then treat the LM-token branch as unsupported by a LINEAR probe for "
+                "this tower; a higher-capacity/nonlinear probe is untested and could differ)"
             )
 
 
@@ -309,8 +318,10 @@ def format_report(cells: Sequence[ProbeCellReport], model_id: str = "(unspecifie
         "",
         "**Scope honesty:** a PASS here means the frozen embeddings linearly carry the "
         "symbols -- it de-risks, but does not replace, the fine-tune (the LM still has to "
-        "learn to read them). A FAIL on clean images means the information was discarded "
-        "by the tower and no fine-tune of its consumers can recover it.",
+        "learn to read them). A FAIL on clean images means no LINEARLY-DECODABLE per-patch "
+        "signal survives to this tap point; a higher-capacity/nonlinear probe run at the same "
+        "tap point could still differ (untested here -- see docs/FINDINGS.md Section 5), so "
+        "treat a FAIL as strong, not absolute, negative evidence.",
         "",
         "| palette | corruption | probe symbol error | train error | RS budget | chance | "
         "verdict |",
