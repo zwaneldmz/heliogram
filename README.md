@@ -116,7 +116,12 @@ This is the route the earlier roadmap called "the entire load-bearing wall of th
 project's economic case" — reading multiple patch-symbols out of one merged LM
 token. The probe measured it directly and it is not there. The fine-tune that
 route implied is therefore **not pursued**; the cheap Step-0 experiment that would
-have gated it came back negative for tens of dollars, exactly as intended.
+have gated it came back negative for tens of dollars, exactly as intended. (A
+narrower question the frozen-tower probe does not settle — whether a *cheaply
+trained* merger, rather than the stock frozen one, could carry the pre-merger
+partial signal through to the LM boundary — is staged as a designed,
+refuse-without-model go/no-go that has not been run here; see the Reproducing
+section and `scripts/train_merger_adapter.py`.)
 
 **The typography pivot fails too, for a different reason.** The natural fallback —
 render the payload as dense typeset ascii85, the channel towers demonstrably read
