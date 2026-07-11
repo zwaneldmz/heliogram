@@ -67,6 +67,13 @@ __all__ = [
     "sample_binary_payload",
     "token_savings_demo",
     "format_token_savings_report",
+    "CostAsymmetryPoint",
+    "cost_asymmetry_points",
+    "format_cost_asymmetry",
+    "chance_level_symbol_error",
+    "RecoveredBitResult",
+    "effective_cost_per_recovered_bit",
+    "format_effective_cost_per_recovered_bit",
 ]
 
 
@@ -619,6 +626,336 @@ def format_token_savings_report(result: TokenSavingsResult) -> str:
 
 
 # --------------------------------------------------------------------------------------------
+# 3. Cost asymmetry: equal token COUNT is not equal token COST
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass
+class CostAsymmetryPoint:
+    """One point in the cost-asymmetry argument (Task 4, part 1): even where an image/merged
+    vision token and a text token cost the SAME number of LM-context tokens, they are not
+    compute/memory-equivalent -- the image path pays for a full vision-tower forward pass a text
+    token never incurs. Same shape as `ExactnessPoint`: a claim, plus each side's story, plus a
+    `status` tag. `status` is always `"structural"` here -- every claim below is true by
+    construction of a ViT-encoder-plus-2x2-merger architecture (which Qwen2.5-VL, this project's
+    pinned scope, documented-ly is) -- but anywhere a claim's MAGNITUDE (a FLOP count, a
+    millisecond figure, a specific encoder depth, a serving stack's caching policy) would depend
+    on Qwen2.5-VL's specific numbers or deployment, the text flags it inline as an explicit
+    "(ASSUMPTION: ...)" aside rather than asserting a number. No FLOP/latency/memory figure is
+    invented anywhere in this dataclass or `cost_asymmetry_points()`."""
+
+    claim: str
+    image_tokens: str
+    text_tokens: str
+    status: str
+
+
+def cost_asymmetry_points() -> List[CostAsymmetryPoint]:
+    """THE cost-asymmetry note (Task 4, part 1): a structural, model-free argument that
+    RESULTS.md's per-2x2-merged-token accounting (lm_tokens_2x2 / lm_token_ratio -- NOT
+    recomputed here; see that file for the actual counts) answers only "how many tokens", never
+    "how much compute/memory". Even at EQUAL token COUNT, a heliogram image token is not
+    free-equivalent to a text token, because reaching that merged token at all required routing
+    pixels through Qwen2.5-VL's own frozen vision tower -- patch embed, N ViT transformer blocks,
+    and the 2x2 patch merger -- BEFORE the LM ever sees it, while a text token is a direct
+    embedding-table lookup. The three points below make that precise without inventing a single
+    FLOP or millisecond number anywhere.
+    """
+    return [
+        CostAsymmetryPoint(
+            claim=(
+                "ViT encoder overhead: image tokens pay for a full vision-tower forward pass "
+                "that text tokens never incur"
+            ),
+            image_tokens=(
+                "Every heliogram patch must be routed through Qwen2.5-VL's frozen vision tower "
+                "(patch embed -> N ViT transformer blocks -> the 2x2 patch merger that folds "
+                "four raw patches into one LM-visible token) before the merged token exists at "
+                "all -- extra prefill compute and latency with no text-side equivalent step. "
+                "(ASSUMPTION, model-specific: the actual FLOP count or millisecond cost of that "
+                "pass depends on Qwen2.5-VL's specific encoder depth/width and the serving "
+                "stack's batching/caching behavior -- no such number is asserted here, only that "
+                "the step exists and a text token never pays it.)"
+            ),
+            text_tokens=(
+                "A text token is an embedding-table lookup: O(1), no separate network forward "
+                "pass, no analogous 'text tower' stage of any kind."
+            ),
+            status="structural",
+        ),
+        CostAsymmetryPoint(
+            claim=(
+                "KV-cache / activation footprint: the encoder's own activations are extra "
+                "memory a text-only prompt never allocates"
+            ),
+            image_tokens=(
+                "Producing each merged image token requires materializing the vision tower's "
+                "own intermediate activations (patch embeddings, every ViT block's activations, "
+                "the merger's inputs) -- memory a text-only forward pass never allocates at "
+                "all. Once a merged token IS in the LM's context, its own per-token KV-cache "
+                "entry is comparable in size to a text token's (same hidden dimension) -- the "
+                "asymmetry is not in the LM's KV-cache line, it is in the encoder's OWN "
+                "footprint sitting in front of it. (ASSUMPTION, model-specific: whether/how long "
+                "the encoder's activations are retained -- freed immediately after the merger "
+                "runs, or kept for some multi-turn image-caching optimization -- is a "
+                "serving-stack decision this module does not assume a specific answer for.)"
+            ),
+            text_tokens=(
+                "A text token's KV-cache entry is created directly from its embedding-table "
+                "lookup -- no upstream encoder activations exist to allocate or free at all."
+            ),
+            status="structural",
+        ),
+        CostAsymmetryPoint(
+            claim=(
+                "Prefill attention compute: O(n^2) applies equally to both token kinds, so equal "
+                "token COUNT is NOT equal token COST -- the load-bearing point"
+            ),
+            image_tokens=(
+                "Once merged image tokens sit in the LM's context, self-attention over them "
+                "costs the same O(n^2) in sequence length as attention over the same COUNT of "
+                "text tokens -- LM-side attention compute per token is comparable, not "
+                "penalized. But the image path additionally pays for the vision-tower forward "
+                "pass (point 1 above) and its own activation footprint (point 2 above) BEFORE "
+                "any of those tokens exist for the LM to attend over at all -- cost a text-only "
+                "prompt of the identical final token count never incurs. So RESULTS.md's "
+                "'fewer/comparable tokens than base64/hex' result is a token-COUNT claim; it "
+                "does NOT by itself imply an equal or lower compute/memory COST -- the two are "
+                "equal ONLY inside the LM's own attention layers, and the image path pays extra "
+                "outside them, on top."
+            ),
+            text_tokens=(
+                "A same-length text prompt pays exactly that O(n^2) LM-attention cost and "
+                "nothing else -- there is no upstream stage to add anything on top of it."
+            ),
+            status="structural",
+        ),
+    ]
+
+
+def format_cost_asymmetry(points: Optional[List[CostAsymmetryPoint]] = None) -> str:
+    """Pretty-print `cost_asymmetry_points()`'s output as plain text."""
+    if points is None:
+        points = cost_asymmetry_points()
+    lines = [
+        "COST ASYMMETRY: equal token COUNT is not equal token COST (image vs. text tokens)",
+        "=" * 78,
+        "",
+    ]
+    for i, p in enumerate(points, 1):
+        lines += [
+            f"{i}. {p.claim}  [{p.status}]",
+            f"   heliogram image tokens: {p.image_tokens}",
+            f"   text tokens:            {p.text_tokens}",
+            "",
+        ]
+    lines.append(
+        "One line: self-attention is O(n^2) in sequence length for BOTH token kinds, so equal "
+        "token count buys equal LM-attention cost -- but the image path pays its vision-tower "
+        "encoder pass and activation footprint ON TOP of that, with no text-side analogue. "
+        "'Cheaper on token count' (RESULTS.md) does not, by itself, mean 'cheaper on compute or "
+        "memory'."
+    )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------------
+# 4. Effective cost per recovered bit -- HYPOTHETICAL, assumption-gated (Task 4, part 2)
+# --------------------------------------------------------------------------------------------
+
+
+def chance_level_symbol_error(palette: int) -> float:
+    """Exact arithmetic, not a measurement: if a reader carries literally zero information about
+    a patch's symbol and guesses uniformly at random among the `palette` possible values, it is
+    wrong `1 - 1/palette` of the time. This is the SAME convention `heliogram.probe`'s
+    `ProbeCellReport.chance_error` already uses (`1.0 - 1.0 / self.palette`) -- restated here,
+    not imported, because this module is deliberately restricted to `heliogram.codec` /
+    `heliogram.corruption` / `heliogram.baselines` imports only (see module docstring) and must
+    not pull in `heliogram.probe`. Not a drifted second definition: same formula, same numbers
+    (e.g. palette=256 -> 255/256 = 0.99609375, palette=16 -> 15/16 = 0.9375 -- matching
+    docs/FINDINGS.md's post-merger probe table's "chance" column exactly at both palettes).
+    """
+    if palette < 1:
+        raise ValueError(f"palette must be >= 1, got {palette!r}")
+    return 1.0 - 1.0 / palette
+
+
+@dataclass
+class RecoveredBitResult:
+    """One HYPOTHETICAL scenario for `effective_cost_per_recovered_bit`: what cost/recovered-bit
+    WOULD be, IF a post-merger reader achieved `assumed_symbol_error`. See
+    `format_effective_cost_per_recovered_bit`'s mandatory headline caveat: the stock, frozen
+    Qwen2.5-VL tower's OWN measured post-merger symbol error is at/near chance (probe_report.md /
+    docs/FINDINGS.md sec 3), i.e. it realizes NONE of this in practice -- every row this
+    dataclass produces is a conditional projection, never a realized benefit."""
+
+    payload_bits: int
+    tokens: int
+    bits_per_symbol: int
+    nsym: int
+    nsize: int
+    assumed_symbol_error: float
+    assumption_label: str
+    rs_budget_fraction: float
+    within_rs_budget: bool
+    recovered_bit_fraction: float
+    recovered_bits: int
+    cost_per_recovered_bit: Optional[float]
+    note: str
+
+
+def effective_cost_per_recovered_bit(
+    payload_bits: int,
+    tokens: int,
+    assumed_symbol_error: Optional[float],
+    bits_per_symbol: int,
+    nsym: int = 32,
+    nsize: int = RS_NSIZE,
+    assumption_label: str = "",
+) -> RecoveredBitResult:
+    """HONESTY-CRITICAL (Task 4, part 2): cost/recovered-bit = tokens / recovered_bits, where
+    `recovered_bits` is computed from an EXPLICIT, CALLER-SUPPLIED `assumed_symbol_error` -- NOT
+    a default that implies success. `assumed_symbol_error=None` (or omitted) raises ValueError:
+    this function will not silently assume any reader recovers anything. This mirrors the reason
+    this whole report exists: the stock, frozen Qwen2.5-VL tower's own measured post-merger
+    symbol error is AT/NEAR CHANCE (probe_report.md / docs/FINDINGS.md sec 3) -- i.e. the real,
+    measured number for "what does the stock tower achieve" is "effectively none of this", and
+    asserting a default recovery rate here would silently launder that negative result away.
+
+    Recovery model ("the code's own model", per the Task 4 spec): Reed-Solomon's guarantee
+    (`rs_error_correction_capacity`) is a step function, not a graded one -- within its
+    correction budget (`floor(nsym/2)` bytes per `nsize`-byte chunk) decode succeeds EXACTLY,
+    deterministically; beyond it, decode detects-or-fails with overwhelming probability (see
+    `rs_error_correction_capacity`'s docstring -- `decode_pixels` never returns a partial-credit
+    payload either way). So this function treats `assumed_symbol_error` as a proxy for the
+    fraction of RS-layer bytes it corrupts (ASSUMPTION: one misclassified symbol implies at
+    least one corrupted packed byte, so a symbol-error rate is a lower bound on / stand-in for
+    the byte-error rate RS actually sees -- not an exact mapping, but it does not require
+    inventing any additional error-propagation model here) and compares it directly against the
+    RS correction-budget fraction (`rs_budget_fraction = floor(nsym/2) / nsize`, ~6.27% at the
+    codec's default nsym=32 -- the same figure docs/FINDINGS.md/README.md already cite):
+
+      - `assumed_symbol_error <= rs_budget_fraction`: WITHIN budget -> the RS guarantee's exact
+        half applies -- `recovered_bit_fraction = 1.0`, `recovered_bits = payload_bits`.
+      - `assumed_symbol_error >  rs_budget_fraction`: beyond budget -> decode detects-or-fails
+        with overwhelming probability and `decode_pixels` never returns a partial payload ->
+        `recovered_bit_fraction = 0.0`, `recovered_bits = 0`, and `cost_per_recovered_bit` is
+        `None` (undefined/infinite: tokens spent divided by zero bits recovered is not a number
+        -- see `format_effective_cost_per_recovered_bit`, which prints this as "undefined
+        (infinite) -- 0 bits recovered").
+
+    `bits_per_symbol` is not used in the threshold arithmetic above (the RS budget is already
+    stated in bytes, independent of palette) -- it is carried through purely for the report's own
+    context line (translating `assumed_symbol_error` back to "at palette=2**bits_per_symbol,
+    chance-level error would be ...", see `chance_level_symbol_error`), so a reader of the report
+    can sanity-check an assumed error against the chance-level anchor for the SAME palette
+    without re-deriving it.
+    """
+    if assumed_symbol_error is None:
+        raise ValueError(
+            "assumed_symbol_error must be given explicitly -- this function refuses to assume "
+            "any recovery rate by default. The stock, frozen Qwen2.5-VL tower's own measured "
+            "post-merger symbol error is at/near CHANCE (see probe_report.md / "
+            "docs/FINDINGS.md sec 3), i.e. it realizes approximately NONE of the hypothetical "
+            "benefit this function computes -- pass an explicit, labeled assumption (e.g. the "
+            "RS correction budget as an optimistic 'if it worked' anchor via "
+            "rs_error_correction_capacity(), or chance_level_symbol_error(palette) to see cost "
+            "correctly blow up to undefined/infinite) instead of relying on a default."
+        )
+    if not (0.0 <= assumed_symbol_error <= 1.0):
+        raise ValueError(
+            f"assumed_symbol_error must be in [0.0, 1.0], got {assumed_symbol_error!r}"
+        )
+    if payload_bits < 0:
+        raise ValueError(f"payload_bits must be >= 0, got {payload_bits!r}")
+    if tokens <= 0:
+        raise ValueError(f"tokens must be > 0, got {tokens!r}")
+    if bits_per_symbol < 1:
+        raise ValueError(f"bits_per_symbol must be >= 1, got {bits_per_symbol!r}")
+
+    rs = rs_error_correction_capacity(nsym=nsym, nsize=nsize)
+    rs_budget_fraction = rs.max_correctable_byte_errors_per_chunk / rs.nsize
+    within_budget = assumed_symbol_error <= rs_budget_fraction
+    recovered_bit_fraction = 1.0 if within_budget else 0.0
+    recovered_bits = payload_bits if within_budget else 0
+    cost_per_recovered_bit = (tokens / recovered_bits) if recovered_bits > 0 else None
+
+    note = (
+        f"assumed_symbol_error={assumed_symbol_error:.4f} vs. rs_budget_fraction="
+        f"{rs_budget_fraction:.4f} (floor({nsym}/2)/{nsize}) -> "
+        f"{'WITHIN' if within_budget else 'BEYOND'} the RS correction budget -> "
+        f"recovered_bit_fraction={recovered_bit_fraction:.1f}. "
+        + (
+            "cost_per_recovered_bit is a real, finite number under this ASSUMPTION only -- it "
+            "is not observed on any real reader."
+            if cost_per_recovered_bit is not None
+            else "cost_per_recovered_bit is undefined/infinite: tokens were spent but the "
+            "assumed error rate is beyond what this RS configuration can correct, so "
+            "decode_pixels-style logic detects-or-fails and 0 bits are recovered."
+        )
+    )
+    return RecoveredBitResult(
+        payload_bits=payload_bits,
+        tokens=tokens,
+        bits_per_symbol=bits_per_symbol,
+        nsym=nsym,
+        nsize=nsize,
+        assumed_symbol_error=assumed_symbol_error,
+        assumption_label=assumption_label or "(unlabeled assumption)",
+        rs_budget_fraction=rs_budget_fraction,
+        within_rs_budget=within_budget,
+        recovered_bit_fraction=recovered_bit_fraction,
+        recovered_bits=recovered_bits,
+        cost_per_recovered_bit=cost_per_recovered_bit,
+        note=note,
+    )
+
+
+def format_effective_cost_per_recovered_bit(results: List[RecoveredBitResult]) -> str:
+    """Pretty-print one or more `RecoveredBitResult` scenarios as plain text. The headline is the
+    mandatory caveat (Task 4, part 2): this whole report is a CONDITIONAL projection under an
+    ASSUMED recovery rate the stock tower does not achieve, never a realized benefit."""
+    lines = [
+        "EFFECTIVE COST PER RECOVERED BIT -- HYPOTHETICAL, ASSUMPTION-GATED (not a realized "
+        "benefit)",
+        "=" * 78,
+        "",
+        "This is a CONDITIONAL projection under an ASSUMED recovery rate that the stock frozen "
+        "Qwen2.5-VL tower does NOT achieve -- the probe measured post-merger symbol error at/near "
+        "chance (see probe_report.md / docs/FINDINGS.md §3). It is an upper bound on a "
+        "hypothetical, not a realized benefit.",
+        "",
+    ]
+    for r in results:
+        palette_note = f"palette=2**{r.bits_per_symbol}={2 ** r.bits_per_symbol}"
+        cost_str = (
+            f"{r.cost_per_recovered_bit:.6f} tokens/bit"
+            if r.cost_per_recovered_bit is not None
+            else "undefined (infinite) -- 0 bits recovered"
+        )
+        lines += [
+            f"scenario: {r.assumption_label}",
+            f"  ASSUMPTION: assumed_symbol_error = {r.assumed_symbol_error:.4f} ({palette_note})",
+            f"  RS correction budget: {r.rs_budget_fraction:.4f} (floor({r.nsym}/2)/{r.nsize})",
+            f"  within RS budget?: {r.within_rs_budget}",
+            f"  recovered_bit_fraction: {r.recovered_bit_fraction:.1f}  "
+            f"(recovered_bits={r.recovered_bits} of payload_bits={r.payload_bits})",
+            f"  tokens spent: {r.tokens}",
+            f"  cost per recovered bit: {cost_str}",
+            f"  {r.note}",
+            "",
+        ]
+    lines.append(
+        "Reminder: nothing above is measured on a real reader. The stock, frozen Qwen2.5-VL "
+        "tower's measured post-merger symbol error is at/near chance for every palette tested "
+        "(probe_report.md, probe_report_7b.md; see docs/FINDINGS.md §3) -- i.e. its OWN row "
+        "in this table would show recovered_bit_fraction=0.0 and cost_per_recovered_bit "
+        "undefined/infinite, same as the chance-level scenario above."
+    )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------------
 
@@ -668,6 +1005,45 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print()
     print(format_exactness_argument())
+
+    print()
+    print(format_cost_asymmetry())
+
+    # Two assumed-error scenarios, both computed fresh, right now, from real arithmetic on this
+    # run's own binary-payload numbers (payload_bits/tokens) -- never invented: (1) the RS
+    # correction budget itself as an optimistic "if it worked" anchor (assumed_symbol_error
+    # exactly AT the budget -> just barely within it -> full hypothetical recovery), and (2) the
+    # chance-level anchor for this run's palette (assumed_symbol_error = chance_level_symbol_error
+    # (args.palette), the same "at/near chance" regime the probe actually measured -> cost blows
+    # up to undefined/infinite). See format_effective_cost_per_recovered_bit's mandatory caveat.
+    rs_guarantee = rs_error_correction_capacity(nsym=args.nsym)
+    rs_budget_fraction = rs_guarantee.max_correctable_byte_errors_per_chunk / rs_guarantee.nsize
+    bps = args.palette.bit_length() - 1  # log2(palette); palette is always a power of two here
+
+    optimistic = effective_cost_per_recovered_bit(
+        payload_bits=binary_result.payload_len * 8,
+        tokens=binary_result.total_patches,
+        assumed_symbol_error=rs_budget_fraction,
+        bits_per_symbol=bps,
+        nsym=args.nsym,
+        assumption_label=(
+            f"OPTIMISTIC anchor: assumed_symbol_error == the RS correction budget itself "
+            f"({rs_budget_fraction:.4f}, i.e. 'if it worked exactly at the edge of the budget')"
+        ),
+    )
+    chance = effective_cost_per_recovered_bit(
+        payload_bits=binary_result.payload_len * 8,
+        tokens=binary_result.total_patches,
+        assumed_symbol_error=chance_level_symbol_error(args.palette),
+        bits_per_symbol=bps,
+        nsym=args.nsym,
+        assumption_label=(
+            f"CHANCE-LEVEL anchor: assumed_symbol_error == chance_level_symbol_error(palette="
+            f"{args.palette}) -- the regime the probe actually measured (see probe_report.md)"
+        ),
+    )
+    print()
+    print(format_effective_cost_per_recovered_bit([optimistic, chance]))
     return 0
 
 

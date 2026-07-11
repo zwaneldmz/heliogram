@@ -42,11 +42,18 @@ import pytest
 import heliogram.baselines as baselines_mod
 from heliogram.baselines import MeasuredBase64Baseline, load_measured_baseline
 from heliogram.benefit import (
+    CostAsymmetryPoint,
     ExactnessPoint,
+    RecoveredBitResult,
     RSGuarantee,
     TokenSavingsResult,
     _estimate_raw_text_tokens,
+    chance_level_symbol_error,
+    cost_asymmetry_points,
+    effective_cost_per_recovered_bit,
     exactness_argument,
+    format_cost_asymmetry,
+    format_effective_cost_per_recovered_bit,
     format_exactness_argument,
     format_token_savings_report,
     rs_error_correction_capacity,
@@ -463,3 +470,249 @@ def test_measured_base64_baseline_note_property_is_the_fixed_cross_group_contrac
     assert m.note == "hello world" == m.measured_note
     assert m.bits_per_token == 5.0
     assert m.tokenizer_id == "fake/id"
+
+
+# --- Task 4, part 1: cost_asymmetry_points / format_cost_asymmetry --------------------------
+
+
+def test_cost_asymmetry_points_structure_and_statuses():
+    points = cost_asymmetry_points()
+    assert len(points) == 3
+    assert all(isinstance(p, CostAsymmetryPoint) for p in points)
+    # every point in this argument is structural/architectural (true by construction of a
+    # ViT-encoder-plus-merger design) -- no point here is an "open measurement" the way
+    # exactness_argument's error-rate point is.
+    assert all(p.status == "structural" for p in points)
+
+
+def test_cost_asymmetry_points_covers_the_three_required_claims():
+    points = cost_asymmetry_points()
+    claims = " ".join(p.claim.lower() for p in points)
+    assert "vit" in claims or "vision-tower" in claims or "vision tower" in claims
+    assert "kv-cache" in claims or "kv cache" in claims or "activation" in claims
+    assert "o(n^2)" in claims or "attention" in claims
+
+
+def test_cost_asymmetry_points_load_bearing_point_states_count_ne_cost():
+    """The third point (prefill attention compute) is explicitly flagged, in the task spec, as
+    the LOAD-BEARING honesty point: equal token count does not imply equal compute/memory cost.
+    Assert that logical content is actually present in the text, not just claimed."""
+    points = cost_asymmetry_points()
+    attention_point = points[2]
+    assert "o(n^2)" in attention_point.image_tokens.lower()
+    assert "on top" in attention_point.image_tokens.lower() or "extra" in attention_point.claim.lower()
+    # must not claim the image path is cheaper or equal on compute merely because token counts
+    # are comparable -- that is precisely the fallacy this point exists to block.
+    combined = (attention_point.claim + attention_point.image_tokens).lower()
+    assert "does not" in combined or "not, by itself" in combined or "not equal" in combined.replace(
+        "-", " "
+    )
+
+
+def test_cost_asymmetry_points_flags_model_specific_magnitudes_as_assumptions():
+    """No FLOP/latency/memory NUMBER may be invented; any model-specific magnitude claim must be
+    explicitly flagged as an assumption in the text (per the Task 4 spec)."""
+    points = cost_asymmetry_points()
+    assumption_points = [p for p in points if "ASSUMPTION" in p.image_tokens]
+    assert len(assumption_points) >= 2  # points 1 and 2 both flag model-specific magnitudes
+    for p in points:
+        # no numeric FLOP/ms/GB figure invented anywhere (only structural/architectural counts
+        # like "2x2" or "O(n^2)", which are architecture facts, not invented performance numbers)
+        assert "flops" not in p.image_tokens.lower() or "no such number is asserted" in p.image_tokens.lower()
+
+
+def test_format_cost_asymmetry_default_uses_cost_asymmetry_points():
+    assert format_cost_asymmetry() == format_cost_asymmetry(cost_asymmetry_points())
+
+
+def test_format_cost_asymmetry_prints_all_points_and_load_bearing_summary():
+    text = format_cost_asymmetry()
+    assert "COST ASYMMETRY" in text
+    for i in range(1, 4):
+        assert f"{i}." in text
+    assert "o(n^2)" in text.lower()
+    assert "not, by itself" in text.lower() or "does not" in text.lower()
+
+
+def test_format_cost_asymmetry_is_deterministic():
+    assert format_cost_asymmetry() == format_cost_asymmetry()
+
+
+# --- Task 4, part 2: chance_level_symbol_error -----------------------------------------------
+
+
+def test_chance_level_symbol_error_hand_computed():
+    """Exact arithmetic (1 - 1/palette), hand-checked against docs/FINDINGS.md's post-merger
+    probe table's own "chance" column values at palette=16 and palette=256."""
+    assert chance_level_symbol_error(16) == pytest.approx(15 / 16)
+    assert chance_level_symbol_error(16) == pytest.approx(0.9375)
+    assert chance_level_symbol_error(256) == pytest.approx(255 / 256)
+    assert chance_level_symbol_error(256) == pytest.approx(0.99609375)
+    assert chance_level_symbol_error(2) == pytest.approx(0.5)
+
+
+def test_chance_level_symbol_error_rejects_invalid_palette():
+    with pytest.raises(ValueError):
+        chance_level_symbol_error(0)
+    with pytest.raises(ValueError):
+        chance_level_symbol_error(-1)
+
+
+# --- Task 4, part 2: effective_cost_per_recovered_bit -- HONESTY-CRITICAL --------------------
+
+
+def test_effective_cost_per_recovered_bit_refuses_none_assumption():
+    """The function must never silently assume a recovery rate -- assumed_symbol_error=None (or
+    simply omitted) must raise, not default to some optimistic number."""
+    with pytest.raises(ValueError):
+        effective_cost_per_recovered_bit(
+            payload_bits=8000,
+            tokens=1000,
+            assumed_symbol_error=None,
+            bits_per_symbol=8,
+        )
+
+
+def test_effective_cost_per_recovered_bit_rejects_out_of_range_error_rate():
+    with pytest.raises(ValueError):
+        effective_cost_per_recovered_bit(
+            payload_bits=8000, tokens=1000, assumed_symbol_error=-0.1, bits_per_symbol=8
+        )
+    with pytest.raises(ValueError):
+        effective_cost_per_recovered_bit(
+            payload_bits=8000, tokens=1000, assumed_symbol_error=1.1, bits_per_symbol=8
+        )
+
+
+def test_effective_cost_per_recovered_bit_within_rs_budget_recovers_full_payload():
+    """Hand-computed: nsym=32, RS_NSIZE=255 -> rs_budget_fraction = 16/255 (~0.0627, the RS
+    budget cited throughout docs/FINDINGS.md/README.md). An assumed_symbol_error exactly AT that
+    budget is WITHIN it (<=), so under the code's own (step-function) recovery model, the full
+    payload is hypothetically recovered."""
+    budget_fraction = 16 / 255
+    result = effective_cost_per_recovered_bit(
+        payload_bits=48000,
+        tokens=7168,
+        assumed_symbol_error=budget_fraction,
+        bits_per_symbol=8,
+        nsym=32,
+    )
+    assert isinstance(result, RecoveredBitResult)
+    assert result.rs_budget_fraction == pytest.approx(16 / 255)
+    assert result.within_rs_budget is True
+    assert result.recovered_bit_fraction == pytest.approx(1.0)
+    assert result.recovered_bits == 48000
+    assert result.cost_per_recovered_bit == pytest.approx(7168 / 48000)
+
+
+def test_effective_cost_per_recovered_bit_chance_level_gives_zero_recovery_and_undefined_cost():
+    """HAZARD case (the whole point of this function): an assumed chance-level symbol error
+    (the regime the frozen-tower probe actually measured, at/near chance -- see probe_report.md)
+    must NOT be assumed to recover anything. recovered_bits must be 0, and cost_per_recovered_bit
+    must be undefined (None), never a finite number, never divide-by-zero, never invented."""
+    chance = chance_level_symbol_error(256)
+    result = effective_cost_per_recovered_bit(
+        payload_bits=48000,
+        tokens=7168,
+        assumed_symbol_error=chance,
+        bits_per_symbol=8,
+        nsym=32,
+    )
+    assert result.within_rs_budget is False
+    assert result.recovered_bit_fraction == pytest.approx(0.0)
+    assert result.recovered_bits == 0
+    assert result.cost_per_recovered_bit is None
+
+
+def test_effective_cost_per_recovered_bit_just_above_budget_also_recovers_nothing():
+    budget_fraction = 16 / 255
+    result = effective_cost_per_recovered_bit(
+        payload_bits=1000,
+        tokens=500,
+        assumed_symbol_error=budget_fraction + 1e-9,
+        bits_per_symbol=8,
+        nsym=32,
+    )
+    assert result.within_rs_budget is False
+    assert result.recovered_bits == 0
+    assert result.cost_per_recovered_bit is None
+
+
+def test_effective_cost_per_recovered_bit_rejects_nonpositive_tokens_or_negative_payload():
+    with pytest.raises(ValueError):
+        effective_cost_per_recovered_bit(
+            payload_bits=1000, tokens=0, assumed_symbol_error=0.01, bits_per_symbol=8
+        )
+    with pytest.raises(ValueError):
+        effective_cost_per_recovered_bit(
+            payload_bits=-1, tokens=1000, assumed_symbol_error=0.01, bits_per_symbol=8
+        )
+
+
+def test_effective_cost_per_recovered_bit_is_deterministic():
+    a = effective_cost_per_recovered_bit(
+        payload_bits=48000, tokens=7168, assumed_symbol_error=0.05, bits_per_symbol=8, nsym=32
+    )
+    b = effective_cost_per_recovered_bit(
+        payload_bits=48000, tokens=7168, assumed_symbol_error=0.05, bits_per_symbol=8, nsym=32
+    )
+    assert a == b
+
+
+def test_format_effective_cost_per_recovered_bit_contains_mandatory_caveat():
+    """The formatter's HEADLINE must state the mandatory conditional-projection caveat, and must
+    cross-reference the probe's negative post-merger result -- per the Task 4 spec, verbatim
+    enough to be unambiguous to a reader skimming only the top of the report."""
+    optimistic = effective_cost_per_recovered_bit(
+        payload_bits=48000,
+        tokens=7168,
+        assumed_symbol_error=16 / 255,
+        bits_per_symbol=8,
+        assumption_label="RS budget (optimistic anchor)",
+    )
+    chance = effective_cost_per_recovered_bit(
+        payload_bits=48000,
+        tokens=7168,
+        assumed_symbol_error=chance_level_symbol_error(256),
+        bits_per_symbol=8,
+        assumption_label="chance-level anchor",
+    )
+    text = format_effective_cost_per_recovered_bit([optimistic, chance])
+
+    assert "CONDITIONAL projection" in text
+    assert "ASSUMED recovery rate" in text
+    assert "does NOT achieve" in text
+    assert "at/near chance" in text.lower()
+    assert "probe_report.md" in text
+    assert "docs/FINDINGS.md" in text
+    assert "upper bound on a hypothetical" in text.lower()
+    assert "not a realized benefit" in text.lower()
+    # both scenarios must be labeled explicitly as assumptions, and must be visibly distinct
+    assert "RS budget (optimistic anchor)" in text
+    assert "chance-level anchor" in text
+    assert "undefined (infinite)" in text  # the chance scenario's cost must show as undefined
+
+
+def test_format_effective_cost_per_recovered_bit_shows_at_least_two_scenarios():
+    optimistic = effective_cost_per_recovered_bit(
+        payload_bits=8000, tokens=1000, assumed_symbol_error=16 / 255, bits_per_symbol=8
+    )
+    chance = effective_cost_per_recovered_bit(
+        payload_bits=8000,
+        tokens=1000,
+        assumed_symbol_error=chance_level_symbol_error(256),
+        bits_per_symbol=8,
+    )
+    text = format_effective_cost_per_recovered_bit([optimistic, chance])
+    assert text.count("scenario:") == 2
+
+
+def test_effective_cost_per_recovered_bit_rs_budget_matches_rs_error_correction_capacity():
+    """Cross-check: the budget fraction this function derives internally must match
+    rs_error_correction_capacity()'s own arithmetic exactly -- no second, drifted definition."""
+    rs = rs_error_correction_capacity(nsym=32)
+    expected = rs.max_correctable_byte_errors_per_chunk / rs.nsize
+    result = effective_cost_per_recovered_bit(
+        payload_bits=1000, tokens=500, assumed_symbol_error=0.01, bits_per_symbol=8, nsym=32
+    )
+    assert result.rs_budget_fraction == pytest.approx(expected)
