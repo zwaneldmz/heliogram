@@ -25,8 +25,10 @@ them back through decode_pixels (the reference, model-free decoder), and measure
                        is unchanged; only the formula is fixed.
   total_patches /      THE BENEFIT METRIC (see _token_crossover): total_patches is the grid's
   base64_token_est /   width*height (~1 self-hosted-VLM token/patch); base64_token_est is
-  token_ratio /        ceil(payload/3)*4 (base64 chars, ~1 token/char); token_ratio =
-  heliogram_cheaper    total_patches/base64_token_est. token_ratio < 1.0 means encoding this
+  token_ratio /        ceil(payload/3)*4 base64 chars scaled by BASE64_CHARS_PER_TOKEN (measured
+  heliogram_cheaper    chars/token when a tokenizer baseline exists, else the analytic ~1
+                       char/token -- see _base64_token_estimate); token_ratio =
+                       total_patches/base64_token_est. token_ratio < 1.0 means encoding this
                        payload as a heliogram grid costs FEWER tokens than base64-in-text-context
                        for the SAME bytes -- an accounting fact about token COUNT, independent of
                        (and computed whether or not this cell's decode_success_rate is 1.0 -- see
@@ -152,7 +154,18 @@ def _resolve_base64_baseline() -> object:
 # (a MEASURED tokenizer baseline when one is available, else the analytic 6.0-bits/token
 # assumption -- see that function's docstring) so this number can never silently drift from
 # whichever baseline RESULTS.md's "Baselines" section states each verdict was computed against.
-BASE64_BITS_PER_TOKEN = _resolve_base64_baseline().bits_per_token
+# Resolved ONCE here, and BASE64_CHARS_PER_TOKEN below is read off the SAME resolved object, so
+# Bar A (bits/token) and Bar C (token count via chars/token) can never rest on two different
+# baselines within one run.
+_RESOLVED_BASELINE = _resolve_base64_baseline()
+BASE64_BITS_PER_TOKEN = _RESOLVED_BASELINE.bits_per_token
+# Bar C's token-count side (see _base64_token_estimate): base64 CHARACTERS per token. 1.0 (the
+# analytic ~1 char/token assumption) when no measured baseline exists; the measured value when
+# one does (e.g. 1.3498 for Qwen2.5-VL's tokenizer, measured 2026-07 -- BPE multi-char merges
+# give base64 text MORE than one char/token, which makes base64 CHEAPER than the analytic
+# estimate and is therefore the direction ADVERSE to heliogram's Bar C claim). Module-level on
+# purpose: tests pin either accounting explicitly by monkeypatching this value.
+BASE64_CHARS_PER_TOKEN = getattr(_RESOLVED_BASELINE, "chars_per_token", 1.0)
 
 CORRUPTIONS: Dict[str, Callable] = {
     "clean": lambda img: img,
@@ -315,12 +328,19 @@ def _bits_per_patch_on_success(
 
 
 def _base64_token_estimate(payload_len: int) -> int:
-    """base64-encoded length in characters for a payload of this many bytes -- ceil(n/3)*4, the
-    standard base64 expansion formula -- treated as an ~1 token/char estimate (see
-    heliogram.baselines.base64_bits_per_token's note: common BPE tokenizers emit roughly one
-    token per base64 character). This is the TOKEN side of the crossover comparison; the PATCH
-    side is _grid_stats(...).total_patches -- see _token_crossover."""
-    return math.ceil(payload_len / 3) * 4
+    """Estimated TOKEN cost of shipping this payload as base64 text: ceil(n/3)*4 base64
+    characters (the standard, exact expansion formula) divided by BASE64_CHARS_PER_TOKEN -- the
+    MEASURED chars/token of the resolved tokenizer baseline when one is available (see
+    _resolve_base64_baseline; 1.3498 measured for Qwen2.5-VL's tokenizer), else the analytic ~1
+    char/token assumption (divisor 1.0, which reproduces the old pure-character count exactly).
+    Rounded DOWN (floor): understating base64's token cost is the direction CONSERVATIVE AGAINST
+    heliogram's claim (a smaller denominator makes heliogram's token_ratio look worse, never
+    better), per this project's honesty rule. This is the TOKEN side of the crossover
+    comparison; the PATCH side is _grid_stats(...).total_patches -- see _token_crossover."""
+    chars = math.ceil(payload_len / 3) * 4
+    if chars == 0:
+        return 0  # empty payload costs zero tokens either way (parity with the old char count)
+    return max(1, math.floor(chars / BASE64_CHARS_PER_TOKEN))
 
 
 @dataclass
@@ -340,7 +360,8 @@ def _token_crossover(
 ) -> TokenCrossover:
     """THE BENEFIT METRIC (see module docstring): total self-hosted-VLM patch/token cost
     (total_patches, ~1 token/patch) vs. the base64-in-text-context token cost
-    (base64_token_est, ~1 token/char) for encoding the SAME payload_len bytes -- an accounting
+    (base64_token_est, chars scaled by the resolved chars/token baseline -- see
+    _base64_token_estimate) for encoding the SAME payload_len bytes -- an accounting
     comparison of context COST, independent of bits/patch density. A config can win here
     (token_ratio < 1.0) while still being below the base64 BITS/PATCH bar, because RS/framing
     overhead
@@ -771,7 +792,8 @@ def exact_crossover_payload_size(
 
     Both sides of the ratio this function scans are closed-form for ANY payload size, not just
     the handful the harness happens to sweep: the token-count side is `token_estimator(n)`
-    (`_base64_token_estimate`, `ceil(n/3)*4` -- exact for every n), and the patch/token side is
+    (`_base64_token_estimate`, `ceil(n/3)*4` chars scaled by the resolved chars/token baseline
+    -- closed-form for every n), and the patch/token side is
     `_grid_stats(n, ...).total_patches` or `.lm_tokens_2x2` (exact for every n, mirroring
     `encode`'s own grid math). So instead of interpolating between samples, this walks payload_len
     = 1..max_bytes ONE BYTE AT A TIME and finds the exact smallest payload_len where
@@ -869,7 +891,8 @@ def _token_crossover_section(
         "heliogram grid cost fewer total patches (`total_patches`, the grid's width*height -- "
         "~1 token/patch for a self-hosted VLM that tokenizes at the same patch grid) than "
         "base64-ing the same payload bytes into text tokens (`base64_token_est` = "
-        "ceil(payload/3)*4 base64 characters, ~1 token/char for typical BPE tokenizers -- see "
+        "ceil(payload/3)*4 base64 characters divided by "
+        f"chars/token = {BASE64_CHARS_PER_TOKEN:.4f} -- the resolved tokenizer baseline, see "
         "Baselines above)? `token_ratio = total_patches / base64_token_est`; "
         "`token_ratio < 1.0` means heliogram is CHEAPER on token count for that payload -- an "
         "accounting fact about total context cost for the WHOLE payload, distinct from the "
@@ -1092,15 +1115,25 @@ def write_results_md(
         "a config beating Bar A clean may or may not survive corruption -- the worst-corruption "
         "columns in the same row show that separately, and it is not folded into this bar.",
         f"- **Bar B -- Gate #1 comfort margin ({GATE_BITS_PER_PATCH:.1f} bits/patch, clean AND "
-        "worst-tested-corruption):** deliberately set above Bar A as a robustness margin "
+        "worst-tested-corruption):** originally set as a robustness margin ABOVE Bar A "
         "before this project starts Phase 2 (see the README's Decision Gate). A config \"clears "
         "the gate\" only if its bits/patch is at or above this bar BOTH on a clean image AND in "
         "its single worst-performing tested corruption -- a config that only clears on average "
-        "is not a robust win. **This is a conservative comfort margin, not the real economic "
-        "bar** -- see Bar A and Bar C.",
+        "is not a robust win."
+        + (
+            f" **NOTE: the measured Bar A ({BASE64_BITS_PER_TOKEN:.3f} bits/token) now EXCEEDS "
+            f"Gate #1's fixed {GATE_BITS_PER_PATCH:.1f}-bit bar, so Gate #1 no longer functions "
+            "as a comfort margin above the economic bar -- clearing Gate #1 is NOT sufficient "
+            "to beat measured base64 density. Reported for continuity; Bar A is the bar that "
+            "matters.**"
+            if BASE64_BITS_PER_TOKEN > GATE_BITS_PER_PATCH
+            else " **This is a conservative comfort margin, not the real economic bar** -- see "
+            "Bar A and Bar C."
+        ),
         "- **Bar C -- token crossover (the actual measured benefit claim):** does encoding a "
         "payload as a heliogram grid cost FEWER total patches (~1 token/patch for a "
-        "self-hosted VLM) than base64-ing the same payload into text tokens (~1 token/char)? "
+        "self-hosted VLM) than base64-ing the same payload into text tokens (at "
+        f"chars/token = {BASE64_CHARS_PER_TOKEN:.4f}, the resolved tokenizer baseline)? "
         "This is an ACCOUNTING comparison of token COUNT, not bits/patch density -- a config "
         "can win on Bar C while still failing Bar A, because RS/framing overhead amortizes "
         "differently for the two encodings as payload grows. See the dedicated \"Token "
@@ -1224,14 +1257,15 @@ def write_results_md(
         f"Source: {baseline_source} (see `_resolve_base64_baseline`). **Every Bar A "
         "('beats base64 clean?') verdict in the Headline table above and every "
         "`GATE_BITS_PER_PATCH`/`BASE64_BITS_PER_TOKEN` comparison anywhere in this file is "
-        "computed directly against THIS number.** Bar C's `token_ratio`/`heliogram_cheaper` "
-        "in the \"Token crossover\" section below is DIFFERENT: it is computed from a separate, "
-        "fixed closed-form estimate (`base64_token_est = ceil(payload/3)*4`, an implicit "
-        "~1-base64-char/token assumption) that does **not** currently update from this resolved "
-        "baseline even when a measured one is available -- so if the source above is ANALYTIC, "
-        "both Bar A and Bar C rest on the same 6-bits/token assumption; if it is MEASURED, only "
-        "Bar A reflects the measurement and Bar C still rests on the analytic ~1-char/token "
-        "estimate. This asymmetry is a known limitation, not an oversight papered over here.",
+        "computed directly against THIS number.** Bar C's `token_ratio`/`heliogram_cheaper` in "
+        "the \"Token crossover\" section below now derives from the SAME resolved baseline: "
+        "`base64_token_est = floor(ceil(payload/3)*4 / chars_per_token)` with `chars_per_token "
+        f"= {BASE64_CHARS_PER_TOKEN:.4f}` in this run (1.0 exactly when the source above is "
+        "ANALYTIC, reproducing the old pure-character count; the measured value when it is "
+        "MEASURED -- floor-rounded because understating base64's token cost is the direction "
+        "conservative AGAINST heliogram's claim). The old version of this section documented a "
+        "Bar A/Bar C asymmetry here (Bar C stuck on the analytic ~1-char/token estimate even "
+        "when a measurement existed); that asymmetry is now closed.",
         f"- **Rendered text (geometric, model-free):** {rendered.chars_per_patch:.2f} "
         f"chars/patch = {rendered.bits_per_patch:.2f} bits/patch typesetting a "
         f"{PAYLOAD_SIZE}-byte payload (base64'd, {rendered.text_len} chars) into "
@@ -1491,7 +1525,8 @@ def main(argv=None) -> int:
     palettes_at_subpatch1 = sorted({row["palette"] for row in crossover_rows if row["subpatch"] == 1})
     print(
         "\nToken crossover, subpatch=1 (VLM-meaningful): total_patches vs base64_token_est "
-        "(~1 token/patch, ~1 token/char) -- THE benefit claim, exact byte-granular crossing "
+        "(~1 token/patch vs. the resolved chars/token baseline) -- THE benefit claim, exact "
+        "byte-granular crossing "
         "(see exact_crossover_payload_size), not interpolated between swept sample points. See "
         "RESULTS.md's \"Token crossover\" section for the full table incl. subpatch>1, the "
         "LM-token (2x2 merger) accounting, and jpeg_q70 decode success:"

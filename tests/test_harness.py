@@ -187,15 +187,41 @@ def test_grid_stats_matches_independent_recomputation(payload_len, palette, nsym
     assert g.lm_tokens_2x2 == expected_lm
 
 
-def test_base64_token_estimate_matches_standard_formula_and_real_base64():
-    """_base64_token_estimate must equal ceil(n/3)*4 -- the standard base64-with-padding
+def test_base64_token_estimate_matches_standard_formula_and_real_base64(monkeypatch):
+    """Under the ANALYTIC ~1-char/token accounting (BASE64_CHARS_PER_TOKEN pinned to 1.0 here,
+    since the repo now ships a measured baseline file that changes the import-time default),
+    _base64_token_estimate must equal ceil(n/3)*4 -- the standard base64-with-padding
     expansion -- AND match Python's own base64.b64encode length for real payloads, not just an
-    internally-consistent restatement of the same ceil formula. Unaffected by B1-B4 (B4's fix
-    plan explicitly notes this side of the crossover ratio was already closed-form/exact)."""
+    internally-consistent restatement of the same ceil formula."""
+    monkeypatch.setattr(harness, "BASE64_CHARS_PER_TOKEN", 1.0)
     for n in (0, 1, 2, 3, 4, 5, 6, 48, 1024, 4096, 16384):
         got = harness._base64_token_estimate(n)
         assert got == math.ceil(n / 3) * 4
         assert got == len(base64.b64encode(bytes(n)))
+
+
+def test_base64_token_estimate_scales_by_measured_chars_per_token(monkeypatch):
+    """With a MEASURED chars/token in effect, _base64_token_estimate must divide the exact
+    base64 char count by it and round DOWN -- floor is the direction conservative AGAINST
+    heliogram's Bar C claim (understating base64's token cost makes token_ratio worse for
+    heliogram, never better). Values hand-computed from the committed Qwen2.5-VL measurement
+    (chars_per_token=1.3497740963855422): 4096B -> ceil(4096/3)*4 = 5464 chars ->
+    floor(5464/1.34977...) = floor(4048.078...) = 4048 tokens."""
+    cpt = 1.3497740963855422
+    monkeypatch.setattr(harness, "BASE64_CHARS_PER_TOKEN", cpt)
+    assert harness._base64_token_estimate(4096) == math.floor(5464 / cpt) == 4048
+    assert harness._base64_token_estimate(0) == 0
+    assert harness._base64_token_estimate(1) == math.floor(4 / cpt) == 2
+
+
+def test_base64_chars_per_token_constant_tracks_resolved_baseline():
+    """The import-time BASE64_CHARS_PER_TOKEN must equal the resolved baseline's chars_per_token
+    when a measured baseline is present (the repo now commits one), else 1.0 -- Bar A and Bar C
+    must rest on the SAME resolved baseline, never two different ones (the asymmetry the old
+    RESULTS.md Baselines section documented as a known limitation, now closed)."""
+    resolved = harness._resolve_base64_baseline()
+    assert harness.BASE64_CHARS_PER_TOKEN == getattr(resolved, "chars_per_token", 1.0)
+    assert harness.BASE64_BITS_PER_TOKEN == resolved.bits_per_token
 
 
 # Hand-computed (palette, subpatch, payload_len, nsym) -> (total_patches, base64_token_est,
@@ -235,16 +261,18 @@ _TOKEN_CROSSOVER_CASES = [
 )
 def test_token_crossover_matches_hand_computed_values(
     payload_len, palette, nsym, subpatch, exp_total, exp_b64, exp_ratio, exp_cheaper,
-    exp_lm_tokens, exp_lm_ratio, exp_lm_cheaper,
+    exp_lm_tokens, exp_lm_ratio, exp_lm_cheaper, monkeypatch,
 ):
     """The regression guard this review round flags as entirely missing (see this file's module
     docstring): pins _token_crossover's output against hand-computed total_patches/
     base64_token_est/token_ratio/heliogram_cheaper AND lm_tokens_2x2/lm_token_ratio (B3) for
-    concrete (payload_len, palette, nsym, subpatch) tuples that also match results.csv's own
-    stored rows for the same cells (see each case's comment above) -- so a future change to the
-    data_patches_needed ceil, the base64 formula, the 2x2-merger token count, or either
-    ratio/threshold computation would be caught here even if results.csv were never
-    regenerated."""
+    concrete (payload_len, palette, nsym, subpatch) tuples, under the ANALYTIC ~1-char/token
+    accounting (BASE64_CHARS_PER_TOKEN pinned to 1.0 -- the hand-derived expected values below
+    were computed under that accounting; the measured-chars/token scaling has its own dedicated
+    tests above) -- so a future change to the data_patches_needed ceil, the base64 formula, the
+    2x2-merger token count, or either ratio/threshold computation would be caught here even if
+    results.csv were never regenerated."""
+    monkeypatch.setattr(harness, "BASE64_CHARS_PER_TOKEN", 1.0)
     tc = harness._token_crossover(payload_len, palette, nsym, subpatch)
     assert tc.total_patches == exp_total
     assert tc.base64_token_est == exp_b64
@@ -296,8 +324,11 @@ def test_exact_crossover_payload_size_synthetic_toy_cases(monkeypatch):
     assert never.lowest_ratio_bytes == 1  # ratio is constant here, so the first byte wins
 
 
-def test_exact_crossover_payload_size_real_grid_crossing_and_recrossing_hand_verified():
-    """Real (not synthetic) grid math: palette=256/subpatch=1's per-patch crossing, hand-verified
+def test_exact_crossover_payload_size_real_grid_crossing_and_recrossing_hand_verified(monkeypatch):
+    """Under the ANALYTIC ~1-char/token accounting (BASE64_CHARS_PER_TOKEN pinned to 1.0; the
+    hand computation below was derived under it, and the repo now ships a measured baseline that
+    changes the import-time default) -- real (not synthetic) grid math:
+    palette=256/subpatch=1's per-patch crossing, hand-verified
     by computing `_grid_stats` directly at the two straddling payload sizes (as the fix plan
     requires), including the exact recrossing ("wobble") this staircase ratio actually exhibits
     -- the old linear-interpolation `_crossover_payload_size` could never have reported this,
@@ -316,6 +347,7 @@ def test_exact_crossover_payload_size_real_grid_crossing_and_recrossing_hand_ver
         while base64_token_est only grows to 2076 -- ratio jumps from 2048/2076<1.0 back up to
         2304/2076>1.0, i.e. a genuine recrossing at 1557B.
     """
+    monkeypatch.setattr(harness, "BASE64_CHARS_PER_TOKEN", 1.0)
     n_sym = 32
     g_1536 = harness._grid_stats(1536, 256, n_sym, 1)
     g_1537 = harness._grid_stats(1537, 256, n_sym, 1)
@@ -337,14 +369,16 @@ def test_exact_crossover_payload_size_real_grid_crossing_and_recrossing_hand_ver
     assert result.recrossing_bytes[0] == 1557
 
 
-def test_exact_crossover_payload_size_lm_tokens_flag_switches_numerator_hand_verified():
-    """`lm_tokens=True` must switch the scan's numerator from `total_patches` to
+def test_exact_crossover_payload_size_lm_tokens_flag_switches_numerator_hand_verified(monkeypatch):
+    """Under the ANALYTIC ~1-char/token accounting (pinned; see the test above):
+    `lm_tokens=True` must switch the scan's numerator from `total_patches` to
     `lm_tokens_2x2`, hand-verified at the exact straddling payload sizes for
     palette=256/subpatch=1 (n=96: lm_tokens_2x2=128, base64_token_est=128, ratio=1.0 exactly, NOT
     a crossing; n=97: lm_tokens_2x2 unchanged at 128, base64_token_est=132, ratio<1.0 -- the
     first crossing). This is a MUCH smaller crossing point than the per-patch case
     (1537B, see the test above) -- expected, since lm_tokens_2x2 is ~4x smaller than
     total_patches for the same grid."""
+    monkeypatch.setattr(harness, "BASE64_CHARS_PER_TOKEN", 1.0)
     n_sym = 32
     g_96 = harness._grid_stats(96, 256, n_sym, 1)
     g_97 = harness._grid_stats(97, 256, n_sym, 1)
@@ -358,15 +392,16 @@ def test_exact_crossover_payload_size_lm_tokens_flag_switches_numerator_hand_ver
     assert result.crossing_bytes == 97
 
 
-def test_run_cell_wires_token_crossover_fields_onto_cell_result():
+def test_run_cell_wires_token_crossover_fields_onto_cell_result(monkeypatch):
     """Guards the WIRING, not just the pure function: _run_cell must actually copy
     _token_crossover's output onto the CellResult it returns (total_patches/base64_token_est/
     token_ratio/heliogram_cheaper AND lm_tokens_2x2/lm_token_ratio, B3), not just compute it and
     drop it -- a real (tiny) run through _run_cell, checked against the same hand-computed values
-    test_token_crossover_matches_hand_computed_values pins for the pure function, plus
-    results.csv's own stored row for this exact cell (palette=256, subpatch=1,
-    payload_size=4096, corruption=clean: total_patches=5120, base64_token_est=5464,
-    token_ratio=0.937042..., lm_tokens_2x2=1280, lm_token_ratio=0.234261...)."""
+    test_token_crossover_matches_hand_computed_values pins for the pure function (under the
+    ANALYTIC ~1-char/token accounting, pinned here for the same reason as there): palette=256,
+    subpatch=1, payload_size=4096, corruption=clean: total_patches=5120, base64_token_est=5464,
+    token_ratio=0.937042..., lm_tokens_2x2=1280, lm_token_ratio=0.234261...."""
+    monkeypatch.setattr(harness, "BASE64_CHARS_PER_TOKEN", 1.0)
     result = harness._run_cell(
         palette=256,
         corruption_name="clean",
