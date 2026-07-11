@@ -274,6 +274,25 @@ def test_check_alignment_sanity_fails_loud_when_far_off():
         tma.check_alignment_sanity(0.90)
 
 
+def test_alignment_reference_config_matches_run_probe_defaults():
+    """The alignment gate must measure the pre-merger clean cell at the config that PRODUCED the
+    committed 0.1344 -- run_probe.py's DEFAULT probe config -- not the Design A/B run's own
+    (possibly scaled-up) config. More readout training data legitimately LOWERS the linear-probe
+    error (~0.07 at 48 images), which would false-fail a reproduction check measured at the run's
+    config. Lock ALIGNMENT_REF_* to run_probe's actual defaults so they cannot silently diverge."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("run_probe", REPO_ROOT / "scripts" / "run_probe.py")
+    rp = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("run_probe", rp)
+    spec.loader.exec_module(rp)
+    defaults = rp._parse_args([])
+    assert tma.ALIGNMENT_REF_N_TRAIN_IMAGES == defaults.n_train_images
+    assert tma.ALIGNMENT_REF_N_TEST_IMAGES == defaults.n_test_images
+    assert tma.ALIGNMENT_REF_PAYLOAD_SIZE == defaults.payload_size
+    assert tma.ALIGNMENT_REF_SEED == defaults.seed
+
+
 def test_check_alignment_sanity_respects_custom_target_and_tolerance():
     tma.check_alignment_sanity(0.50, target=0.50, tolerance=0.01)  # must not raise
     with pytest.raises(RuntimeError):

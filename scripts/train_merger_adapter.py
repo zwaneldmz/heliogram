@@ -211,6 +211,20 @@ RS_NSYM_DEFAULT = 32
 
 ALIGNMENT_TOLERANCE = 0.02  # deterministic tolerance band around PREMERGER_CLEAN_SYMBOL_ERROR
 
+# The committed pre-merger alignment number (PREMERGER_CLEAN_SYMBOL_ERROR = 0.1344) was measured
+# at scripts/run_probe.py's DEFAULT probe config (6 train / 3 test images, seed 0, 1024B payload).
+# The alignment sanity cell MUST use that SAME reference config -- not the run's own
+# n_train_images/n_test_images -- so it reproduces the committed number regardless of how much data
+# the Design A/B readout uses. More probe training data legitimately LOWERS the linear-probe error
+# (measured ~0.07 at 48 images vs 0.1344 at 6), so measuring the alignment cell at the run's
+# scaled-up config would FALSE-FAIL this reproduction check even when the pipeline is perfectly
+# correct. Alignment is a pipeline-correctness check (window-shuffle + merge grouping), not a
+# data-scaling measurement; keep it at the reference config.
+ALIGNMENT_REF_N_TRAIN_IMAGES = 6
+ALIGNMENT_REF_N_TEST_IMAGES = 3
+ALIGNMENT_REF_PAYLOAD_SIZE = 1024
+ALIGNMENT_REF_SEED = 0
+
 HONEST_CAVEAT_TEXT = (
     "A trained readout head is NOT the LM. Design-B success means the info CAN be made "
     "recoverable at the LM boundary by a cheap merger -- the go/no-go flips to 'go' and the "
@@ -753,9 +767,12 @@ def run_design_a(
 
     helpers = _bind_run_probe_alignment_helpers()
 
+    # Alignment gate uses the REFERENCE probe config (see ALIGNMENT_REF_* above), NOT this run's
+    # n_train_images/seed/payload_size -- so it reproduces the committed 0.1344 no matter how much
+    # data the Design A/B readout below is asked to use.
     clean_measured = _measure_premerger_clean_symbol_error(
-        helpers, model, processor, dtype, device, palette, seed,
-        n_train_images, n_test_images, payload_size,
+        helpers, model, processor, dtype, device, palette, ALIGNMENT_REF_SEED,
+        ALIGNMENT_REF_N_TRAIN_IMAGES, ALIGNMENT_REF_N_TEST_IMAGES, ALIGNMENT_REF_PAYLOAD_SIZE,
     )
     check_alignment_sanity(clean_measured)
 
@@ -883,9 +900,12 @@ def run_design_b(
 
     helpers = _bind_run_probe_alignment_helpers()
 
+    # Alignment gate uses the REFERENCE probe config (see ALIGNMENT_REF_* above), NOT this run's
+    # n_train_images/seed/payload_size -- so it reproduces the committed 0.1344 no matter how much
+    # data the Design A/B readout below is asked to use.
     clean_measured = _measure_premerger_clean_symbol_error(
-        helpers, model, processor, dtype, device, palette, seed,
-        n_train_images, n_test_images, payload_size,
+        helpers, model, processor, dtype, device, palette, ALIGNMENT_REF_SEED,
+        ALIGNMENT_REF_N_TRAIN_IMAGES, ALIGNMENT_REF_N_TEST_IMAGES, ALIGNMENT_REF_PAYLOAD_SIZE,
     )
     check_alignment_sanity(clean_measured)
 
