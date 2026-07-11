@@ -274,14 +274,24 @@ def test_probe_head_default_is_linear():
     assert args.probe_head == "linear"
 
 
-def test_probe_head_mlp_is_implemented_not_a_refusing_stub():
-    """--probe-head mlp is now IMPLEMENTED (heliogram.probe.fit_mlp_probe), not a stub: main()
-    must NOT raise NotImplementedError for it -- it should proceed past the CLI guards to the
-    model-load stage (which, with no torch installed here, then fails at run_probe._load_tower's
-    `import torch`). We assert it gets that far, i.e. the nonlinear path is real, not refused."""
+def test_probe_head_mlp_is_implemented_not_a_refusing_stub(monkeypatch):
+    """--probe-head mlp is now IMPLEMENTED (heliogram.probe.fit_mlp_probe), not a refusing stub:
+    main() must NOT raise NotImplementedError for it -- it must pass the CLI guards and reach the
+    model-load stage. We monkeypatch _load_tower to a sentinel so the assertion holds regardless
+    of the environment: on a CPU box main() would otherwise die at _load_tower's `import torch`,
+    and on a GPU box it would try to download real weights -- neither is what this test is about.
+    Reaching the sentinel proves the mlp path is real (a stub would raise before _load_tower)."""
     rp = _load_run_probe()
     assert rp._parse_args(["--probe-head", "mlp"]).probe_head == "mlp"
-    with pytest.raises(ModuleNotFoundError):  # reaches _load_tower -> import torch (absent here)
+
+    class _ReachedModelLoad(Exception):
+        pass
+
+    def _sentinel(*args, **kwargs):
+        raise _ReachedModelLoad
+
+    monkeypatch.setattr(rp, "_load_tower", _sentinel)
+    with pytest.raises(_ReachedModelLoad):
         rp.main(["--probe-head", "mlp", "--palettes", "16", "--corruptions", "clean"])
 
 
