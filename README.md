@@ -2,6 +2,10 @@
 
 **If one ViT patch (~1 vision token) can reliably carry more than one text token's worth of data (8.096 bits for base64, measured on Qwen2.5-VL's tokenizer), then encoded images are a cheaper context medium for self-hosted VLMs — heliogram measures whether that's true. Measured answer so far: not per-patch (the codec's per-patch ceiling is 6.996 bits); the surviving route is multiple patch-symbols per merged LM token, which is Phase-2 work.**
 
+**[Read the full findings writeup →](docs/FINDINGS.md)** — the measured economic
+result, the frozen-tower probe mechanism, and the defensive contribution, in one
+place.
+
 heliogram is a patch-aligned optical codec plus an evaluation harness. It encodes
 arbitrary bytes as a grid of solid-color 14x14 blocks (one symbol per ViT patch),
 protects them with Reed–Solomon ECC, runs them through the corruptions a real
