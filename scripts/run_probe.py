@@ -290,12 +290,14 @@ def _match_reverse_indices(pooled, merger_out):
     return torch.tensor(reverse, dtype=torch.long, device=merger_out.device)
 
 
-def _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units: int):
-    """Per-PATCH hidden states at the merger's INPUT (post vision blocks, pre 2x2 merge),
-    restored to raster order: row `m * 4 + p` is merge-unit m (raster over the merged grid),
-    within-unit position p (row-major within the 2x2 block: TL, TR, BL, BR) -- exactly the
-    label layout heliogram.probe.merged_token_labels uses, so `labels.reshape(-1, 1)` aligns
-    1:1 with these rows.
+def _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units: int, merge: int = MERGE):
+    """Per-PATCH hidden states at the merger's INPUT (post vision blocks, pre merge), restored to
+    raster order: row `m * merge**2 + p` is merge-unit m (raster over the merged grid),
+    within-unit position p (row-major within the merge x merge block: TL, TR, BL, BR for the
+    default 2x2) -- exactly the label layout heliogram.probe.merged_token_labels uses, so
+    `labels.reshape(-1, 1)` aligns 1:1 with these rows. `merge` defaults to the module MERGE (2,
+    Qwen2.5-VL); it is threaded from the resolved TOWER_REGISTRY entry (Task 3, GPU stub) so a
+    different-merge tower is a registry value, not a hardcoded 2 here.
 
     WHY THE ORDERING HOLDS (each piece CPU-verified in tests/test_probe_contract_cpu.py):
       - the processor's `pixel_values` rows are already grouped 4-consecutive-per-merge-unit,
@@ -336,12 +338,14 @@ def _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units: int)
 
     merger_in = captured["in"]
     seq_len, hidden = merger_in.shape
-    if seq_len != n_units * 4:
+    patches_per_unit = merge * merge
+    if seq_len != n_units * patches_per_unit:
         raise RuntimeError(
-            f"merger input has {seq_len} rows, expected {n_units * 4} (4 patches per merged "
-            "token) -- token-count contract violated; do not trust this run"
+            f"merger input has {seq_len} rows, expected {n_units * patches_per_unit} "
+            f"({patches_per_unit} patches per merged token, merge={merge}) -- token-count "
+            "contract violated; do not trust this run"
         )
-    units = merger_in.reshape(n_units, 4, hidden)
+    units = merger_in.reshape(n_units, patches_per_unit, hidden)
     return units[reverse].reshape(seq_len, hidden), pooled, reverse
 
 
@@ -382,12 +386,15 @@ def _load_tower(model_id: str, device: str, dtype_name: str, arch: str = DEFAULT
 
 
 def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = "merged",
-                        visual_attrs=("visual", "model.visual")) -> np.ndarray:
+                        visual_attrs=("visual", "model.visual"), merge: int = MERGE) -> np.ndarray:
     """One image -> float32 numpy embeddings for the requested probe stage. Asserts identity
     preprocessing: the processor's reported patch grid must equal the image's own 14px grid.
 
-    `visual_attrs` (Task 3, GPU stub) is forwarded to `_resolve_visual_tower`; its default is
-    that function's own default (the Qwen 4.x/5.x paths), so every existing caller is unchanged.
+    `visual_attrs` and `merge` (Task 3, GPU stub) are forwarded from the resolved TOWER_REGISTRY
+    entry: `visual_attrs` to `_resolve_visual_tower`, `merge` to the merge-unit count and the
+    pre-merger grouping. Both default to the Qwen2.5-VL values (the two attr paths; merge=2), so
+    every existing caller is unchanged -- but a different tower is a registry value, not a
+    hardcoded constant reached silently here.
 
     stage="merged" (default): (n_merged_tokens, out_hidden) POST-merger embeddings, raster
     order -- what the LM actually sees; one row per 2x2 merge unit, 4 symbols per row.
@@ -414,12 +421,12 @@ def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = 
             "note) instead of measuring a corrupted channel."
         )
     visual = _resolve_visual_tower(model, visual_attrs)
-    n_units = (exp_h // MERGE) * (exp_w // MERGE)
+    n_units = (exp_h // merge) * (exp_w // merge)
     pixel_values = out["pixel_values"].to(device=device, dtype=dtype)
     grid_thw = grid_thw.to(device)
 
     if stage == "pre_merger":
-        emb, _, _ = _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units)
+        emb, _, _ = _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units, merge)
         return emb.float().cpu().numpy()
     if stage != "merged":
         raise ValueError(f"unknown probe stage {stage!r}; use 'merged' or 'pre_merger'")
@@ -430,7 +437,8 @@ def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = 
 
 
 def _cell_arrays(model, processor, dtype, device, palette, corruption_name, corruption_fn,
-                 n_images, payload_size, seed_base, stage="merged"):
+                 n_images, payload_size, seed_base, stage="merged",
+                 visual_attrs=("visual", "model.visual"), merge=MERGE):
     """Generate n_images examples for one (palette, corruption) and return stacked
     (embeddings, labels). Labels come from the CLEAN image (dataset contract); embeddings from
     the corrupted one -- exactly the read-through-corruption task.
@@ -454,10 +462,11 @@ def _cell_arrays(model, processor, dtype, device, palette, corruption_name, corr
     for ex in examples:
         w, h = ex.image.width // PATCH_SIZE, ex.image.height // PATCH_SIZE
         symbols = target_to_symbols(ex.target, palette)
-        labels = merged_token_labels(w, h, symbols, merge=MERGE)
+        labels = merged_token_labels(w, h, symbols, merge=merge)
         if stage == "pre_merger":
             labels = labels.reshape(-1, 1)
-        emb = _extract_embeddings(model, processor, dtype, device, ex.image, stage=stage)
+        emb = _extract_embeddings(model, processor, dtype, device, ex.image, stage=stage,
+                                  visual_attrs=visual_attrs, merge=merge)
         if emb.shape[0] != labels.shape[0]:
             raise RuntimeError(
                 f"embedding/label count mismatch: {emb.shape[0]} vs {labels.shape[0]}"
@@ -486,7 +495,12 @@ def main(argv=None) -> int:
             "raises before touching any model rather than fabricating an MLP result. Use "
             "--probe-head linear (the default) for the measured result."
         )
-    _resolve_tower_arch(args.model_arch)  # raises early (pure Python) on unknown/unverified arch
+    # Raises early (pure Python) on unknown/unverified arch; the entry is the single source of
+    # truth for the tower's visual-attr paths and merge factor, threaded through below rather
+    # than reading the module MERGE / hardcoded attr defaults downstream.
+    entry = _resolve_tower_arch(args.model_arch)
+    visual_attrs = entry["visual_attrs"]
+    merge = entry["merge"]
 
     palettes = [int(p) for p in args.palettes.split(",") if p]
     corruption_names = [c.strip() for c in args.corruptions.split(",") if c.strip()]
@@ -507,10 +521,12 @@ def main(argv=None) -> int:
             # Disjoint seed ranges -> disjoint payloads between train and test.
             X_tr, y_tr = _cell_arrays(model, processor, dtype, args.device, palette, cname, cfn,
                                       args.n_train_images, args.payload_size,
-                                      seed_base=args.seed + 1_000, stage=args.probe_stage)
+                                      seed_base=args.seed + 1_000, stage=args.probe_stage,
+                                      visual_attrs=visual_attrs, merge=merge)
             X_te, y_te = _cell_arrays(model, processor, dtype, args.device, palette, cname, cfn,
                                       args.n_test_images, args.payload_size,
-                                      seed_base=args.seed + 2_000_000, stage=args.probe_stage)
+                                      seed_base=args.seed + 2_000_000, stage=args.probe_stage,
+                                      visual_attrs=visual_attrs, merge=merge)
             cell = evaluate_cell(palette, cname, X_tr, y_tr, X_te, y_te,
                                  seed=args.seed, epochs=args.epochs)
             print(f"  symbol_error={cell.fit.symbol_error:.4f} "

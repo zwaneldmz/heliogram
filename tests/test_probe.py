@@ -302,3 +302,41 @@ def test_default_model_arch_is_the_verified_qwen_entry():
     # earns its own CPU contract test -- guard the invariant, not just today's single entry.
     unverified = [name for name, e in rp.TOWER_REGISTRY.items() if not e.get("verified")]
     assert rp.DEFAULT_ARCH not in unverified
+
+
+def test_resolve_visual_tower_walks_dotted_attr_paths():
+    """_resolve_visual_tower must resolve a top-level '.visual' AND a dotted 'model.visual' path
+    (naive getattr(model, 'model.visual') would fail -- the resolver splits on '.'). Pure Python,
+    no torch: exercised with plain stand-in namespaces so a non-Qwen registry entry supplying its
+    own visual_attrs is genuinely reachable, not just declared."""
+    import types
+
+    rp = _load_run_probe()
+    tower = object()  # sentinel stand-in for the real vision tower
+    direct = types.SimpleNamespace(visual=tower)
+    nested = types.SimpleNamespace(model=types.SimpleNamespace(visual=tower))  # no top-level .visual
+    assert rp._resolve_visual_tower(direct) is tower
+    assert rp._resolve_visual_tower(nested) is tower
+    # a caller-supplied path list is honored (the Task-3 registry override mechanism)
+    deep = types.SimpleNamespace(vision_model=types.SimpleNamespace(tower=tower))
+    assert rp._resolve_visual_tower(deep, visual_attrs=("vision_model.tower",)) is tower
+    with pytest.raises(RuntimeError, match="vision tower"):
+        rp._resolve_visual_tower(types.SimpleNamespace())
+
+
+def test_registry_qwen_entry_is_the_single_source_of_truth_for_merge_and_attrs():
+    """The threading fix (TOWER_REGISTRY -> main -> _cell_arrays -> _extract_embeddings) is only
+    correct if the verified Qwen entry's merge/visual_attrs are exactly the downstream defaults;
+    otherwise a future edit to MERGE or the default attr paths could silently diverge from the
+    registry the run actually threads. Lock that consistency so the registry stays the single
+    source of truth, not dead metadata."""
+    import inspect
+
+    rp = _load_run_probe()
+    entry = rp.TOWER_REGISTRY["qwen2_5_vl"]
+    assert entry["merge"] == rp.MERGE
+    sig_resolve = inspect.signature(rp._resolve_visual_tower).parameters
+    sig_extract = inspect.signature(rp._extract_embeddings).parameters
+    assert tuple(entry["visual_attrs"]) == tuple(sig_resolve["visual_attrs"].default)
+    assert tuple(entry["visual_attrs"]) == tuple(sig_extract["visual_attrs"].default)
+    assert sig_extract["merge"].default == rp.MERGE

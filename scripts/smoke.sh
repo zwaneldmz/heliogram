@@ -71,12 +71,26 @@ if [[ $PYTEST_RC -ne 0 ]]; then
     echo "FAIL [pytest]: suite did not pass (exit $PYTEST_RC)"
     exit 1
 fi
-PYTEST_SUMMARY="$(echo "$PYTEST_OUT" | grep -E '^[0-9]+ (passed|failed)' | sed -E 's/ in [0-9]+\.[0-9]+s.*$//' | sed -E 's/, [0-9]+ warnings?$//')"
-if [[ -z "$PYTEST_SUMMARY" ]]; then
-    echo "FAIL [pytest]: could not find a pytest summary line ('N passed...') in output"
+# Floor check, not an exact-count pin: the suite's exit code above already fails smoke on any
+# test error/failure. This second check only guards against silent test LOSS (suite still green
+# but fewer tests ran) -- so it asserts "0 failed" and "passed >= a committed floor" rather than
+# an exact number, which would otherwise break on every legitimately-added or -removed test.
+# `|| true`: on a green run there is no "N failed" token, so that grep matches nothing and exits
+# non-zero -- without this, `set -euo pipefail` would abort the whole script on SUCCESS.
+PYTEST_PASSED="$(echo "$PYTEST_OUT" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1 || true)"
+PYTEST_FAILED="$(echo "$PYTEST_OUT" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | head -1 || true)"
+MIN_PASSED="$(tr -dc '0-9' < "$EXPECTED_DIR/pytest_min_passed.txt")"
+if [[ -z "$PYTEST_PASSED" ]]; then
+    echo "FAIL [pytest]: could not find a 'N passed' count in the summary"
+    STATUS=1
+elif [[ -n "$PYTEST_FAILED" && "$PYTEST_FAILED" -ne 0 ]]; then
+    echo "FAIL [pytest]: $PYTEST_FAILED test(s) failed"
+    STATUS=1
+elif [[ "$PYTEST_PASSED" -lt "$MIN_PASSED" ]]; then
+    echo "FAIL [pytest floor]: only $PYTEST_PASSED passed, expected >= $MIN_PASSED -- possible test loss. If you intentionally removed tests, lower tests/expected/pytest_min_passed.txt."
     STATUS=1
 else
-    check_fixture "pytest summary" "$EXPECTED_DIR/pytest_summary.txt" "$PYTEST_SUMMARY"
+    echo "PASS [pytest]: $PYTEST_PASSED passed (>= floor $MIN_PASSED), 0 failed"
 fi
 
 echo
