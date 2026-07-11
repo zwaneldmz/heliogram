@@ -929,10 +929,17 @@ def run_design_b(
     else:
         trainable_module = _ParallelMergerAdapter(visual.merger, rank=lora_rank)
         out_features = trainable_module.out_features
+    # The trainable module (LoRA adapters / parallel-adapter Linears) and the readout head must
+    # live on the same device as the model, or the forward mixes cuda/cpu tensors (RuntimeError:
+    # "Expected all tensors to be on the same device"). peft injects LoRA onto the base layer's
+    # device already, but a freshly-built head / parallel adapter defaults to CPU -- move both.
+    trainable_module = trainable_module.to(device)
     for p in trainable_module.parameters():
         p.requires_grad_(True)
 
-    head = _QuadReadoutHead(in_features=out_features, hidden_dim=hidden_dim, palette=palette)
+    head = _QuadReadoutHead(
+        in_features=out_features, hidden_dim=hidden_dim, palette=palette
+    ).to(device)
     optimizer = torch.optim.AdamW(
         [p for p in trainable_module.parameters() if p.requires_grad] + list(head.parameters()),
         lr=lr,
@@ -1038,7 +1045,10 @@ def _forward_post_merger_quad_logits(
 
     visual_out = visual(pixel_values, grid_thw=grid_thw)
     merged = helpers["_merged_embeddings_tensor"](visual_out, n_units)
-    return head(merged.to(next(head.parameters()).dtype))
+    # Match the head's device AND dtype (the head trains in its own dtype on `device`; `merged`
+    # comes off the tower in the model's compute dtype). Casting both is robust to head placement.
+    head_param = next(head.parameters())
+    return head(merged.to(device=head_param.device, dtype=head_param.dtype))
 
 
 def _quad_cross_entropy(logits: "torch.Tensor", labels: "torch.Tensor") -> "torch.Tensor":
