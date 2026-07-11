@@ -53,9 +53,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def test_import_learned_alphabet_and_encoder_do_not_pull_in_torch():
     """The exact invariant the task's VERIFY step checks: importing either new module must
-    never require torch/transformers, even transitively."""
-    assert "torch" not in sys.modules
-    assert "transformers" not in sys.modules
+    never require torch/transformers, even transitively. Subprocess-isolated: see
+    tests/conftest.py."""
+    from conftest import assert_import_stays_torch_free
+
+    assert_import_stays_torch_free(
+        "heliogram.instruments.learned_alphabet", "heliogram.encoder"
+    )
 
 
 # --- heliogram.encoder: FrozenEncoderHandle -------------------------------------------------

@@ -35,9 +35,10 @@ def test_import_heliogram_patchsize_does_not_pull_in_torch():
     """Central invariant for this module (mirrors test_phase2_scaffold.py's equivalent check for
     heliogram.vlm): `import heliogram.patchsize` must never require torch/transformers, since
     verify_patch_size only ever reads attributes off caller-supplied objects -- it never loads a
-    model itself."""
-    assert "torch" not in sys.modules
-    assert "transformers" not in sys.modules
+    model itself. Subprocess-isolated: see tests/conftest.py."""
+    from conftest import assert_import_stays_torch_free
+
+    assert_import_stays_torch_free("heliogram.patchsize")
 
 
 # --- known_patch_size -----------------------------------------------------------------------

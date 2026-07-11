@@ -37,10 +37,17 @@ measured — it only names which number this project's scope claim actually rest
 on. The honest flip side: the one corruption an in-scope operator *cannot* opt
 out of is the target model's own image preprocessing — e.g. Qwen2.5-VL's
 `smart_resize`, which snaps input resolution to 28px (patch-size × merge-size)
-multiples before the ViT ever sees a pixel. That resize is not in this
-project's corruption suite yet; it is real, in-scope, and unmeasured, and
-belongs on the Phase-2 to-do list (see "Roadmap / Phase-2 boundary" below), not
-folded silently into the "clean" column above.
+multiples before the ViT ever sees a pixel. **That resize is now IN the
+corruption suite and measured** (two rows: `qwen_smart_resize`, the mandatory
+28px snap under operator-widened pixel bounds; and `qwen_smart_resize_1mp`,
+the stock processor's ~1-megapixel budget, which additionally downscales any
+larger grid wholesale — see `RESULTS.md`). The encode-side fix is also
+implemented and pinned by test: `encode(..., align=2)` rounds the grid up to
+even patch dimensions *before* layout, making `smart_resize` the identity on
+the emitted image with zero wire-format change (`decode_pixels` round-trips it
+with no flag; see `spec/format-v0.1.md` §6 and `tests/test_smart_resize.py`) —
+a deployment targeting a 2×2-merge VLM should always encode with `align=2`,
+and `heliogram.dataset`'s Phase-2 training generators now do exactly that.
 
 This is a measurement project. If the numbers come out below the base64 line, that
 is a result, not a failure — it bounds what optical-context schemes can gain from
@@ -264,6 +271,19 @@ Scope note at the top of `RESULTS.md`.
   per-patch economic claim above — exactly the adverse-direction error the
   earlier honesty note here predicted.** `python -m heliogram.baselines
   --measure` reproduces it (or measures a different tokenizer).
+- **Is base64 even the right bar? (UNMEASURED — the same class of baseline
+  error, still open.)** base64 is not optimal for BPE vocabularies: ascii85/
+  base85 pack 8 bits into 1.25 chars vs base64's 1.33 before BPE effects, so
+  the honest economic bar is the *strongest* reasonable text encoding on the
+  target tokenizer, which may sit above 8.096 bits/token. The measurement code
+  ships in this repo (`heliogram.baselines.measure_text_encoding_baselines`,
+  covering base64/ascii85/base85/hex on identical samples; persisted to
+  `heliogram/data/text_baselines.json`, which `RESULTS.md`'s Bar A qualifier
+  reads), but the environment that prepared this branch had no HuggingFace Hub
+  access, so it has not been run — `python -m heliogram.baselines --measure`
+  now measures both this and the base64 baseline in one command (~1 min, CPU;
+  see `RUNBOOK-GPU.md` step 1). Until then, every "beats base64" verdict reads
+  as exactly that — *base64*, not *text context*.
 - **Rendered text (honesty guardrail).** The obvious competitor is just
   typesetting the payload small and letting the VLM read it — that's what
   DeepSeek-OCR and Glyph exploit. `heliogram.baselines` typesets the payload onto
@@ -312,8 +332,11 @@ Row 0 is a calibration row cycling
 through the palette so the decoder can recover the palette's post-corruption RGB
 values and nearest-neighbor classify every data patch. The reference decoder
 (`decode_pixels`) samples patch centers only — it is deliberately dumb, so that
-what it measures is the channel, not decoder cleverness. Full spec:
-[`spec/format-v0.1.md`](spec/format-v0.1.md).
+what it measures is the channel, not decoder cleverness. `encode(..., align=2)`
+rounds the grid up to even patch dimensions before layout (28px-multiple pixel
+dims at the default patch size) so the pinned target model's own `smart_resize`
+preprocessing passes the image through untouched — wire-compatible, decoder
+needs no flag. Full spec: [`spec/format-v0.1.md`](spec/format-v0.1.md).
 
 ## Instruments (gate-independent)
 
@@ -501,6 +524,17 @@ specifically so there is no room to relax it once there is a working model
 someone is proud of.
 
 ## Phase 2 (GPU) — how to run when you have a GPU
+
+> **Start with [`RUNBOOK-GPU.md`](RUNBOOK-GPU.md)** — the ordered, copy-paste
+> runbook for a rented-GPU session (setup → baselines → Step-0 probe → optional
+> zero-shot floor → QLoRA), with per-step decision rules and the list of
+> artifacts to commit back. The model-facing code below has been CPU-verified
+> against `transformers==5.13.0` with a random-weight Qwen2.5-VL
+> (`tests/test_probe_contract_cpu.py`, `tests/test_train_qlora_lora_targets.py`)
+> — that verification caught three run-blocking defects (visual-tower attribute
+> path, merged-tokens-in-`pooler_output`, and a PEFT suffix-matching leak that
+> silently LoRA-tuned the vision blocks), all fixed on this branch. What remains
+> genuinely unrun is the same code against real weights.
 
 Everything above this section is Phase 1: model-free. This repo also ships a **Phase-2
 scaffold** — code to generate training data, fine-tune a VLM, and plug it into the same

@@ -51,8 +51,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_import_injection_bench_does_not_pull_in_torch():
-    assert "torch" not in sys.modules
-    assert "transformers" not in sys.modules
+    from conftest import assert_import_stays_torch_free
+
+    assert_import_stays_torch_free("heliogram.instruments.injection_bench")
 
 
 # --- BehavioralPayload / BEHAVIORAL_PAYLOADS ---------------------------------------------------

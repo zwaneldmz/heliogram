@@ -16,7 +16,6 @@ BOTH the assertion and this docstring's numbers, don't silently loosen or delete
 
 from __future__ import annotations
 
-import sys
 
 import numpy as np
 import pytest
@@ -33,8 +32,9 @@ from heliogram.instruments.saliency import (
 
 
 def test_import_saliency_does_not_pull_in_torch():
-    assert "torch" not in sys.modules
-    assert "transformers" not in sys.modules
+    from conftest import assert_import_stays_torch_free
+
+    assert_import_stays_torch_free("heliogram.instruments.saliency")
 
 
 # --- SaliencyMap shape / structure -----------------------------------------------------------

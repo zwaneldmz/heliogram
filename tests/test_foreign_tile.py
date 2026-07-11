@@ -17,7 +17,6 @@ delete the check.
 
 from __future__ import annotations
 
-import sys
 
 import numpy as np
 import pytest
@@ -43,8 +42,9 @@ DEFAULT_ALLOWLIST = (AllowListEntry(palette=8), AllowListEntry(palette=16))
 
 
 def test_import_foreign_tile_does_not_pull_in_torch():
-    assert "torch" not in sys.modules
-    assert "transformers" not in sys.modules
+    from conftest import assert_import_stays_torch_free
+
+    assert_import_stays_torch_free("heliogram.instruments.foreign_tile")
 
 
 # --- patch_structure_score: clean tiles vs. natural images --------------------------------------

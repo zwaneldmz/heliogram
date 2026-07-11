@@ -63,10 +63,11 @@ def test_import_heliogram_benefit_does_not_pull_in_torch_or_transformers():
     """heliogram.benefit's module-scope import boundary: transformers is only ever imported
     LAZILY, inside _estimate_raw_text_tokens, when the raw-text measured path is actually
     attempted -- never merely by importing this module. Mirrors test_phase2_scaffold.py's/
-    test_patchsize.py's equivalent checks for heliogram.vlm/heliogram.patchsize. Must run before
-    any test below that installs a fake (or, if misconfigured, a real) transformers module."""
-    assert "torch" not in sys.modules
-    assert "transformers" not in sys.modules
+    test_patchsize.py's equivalent checks for heliogram.vlm/heliogram.patchsize. Subprocess-
+    isolated: see tests/conftest.py."""
+    from conftest import assert_import_stays_torch_free
+
+    assert_import_stays_torch_free("heliogram.benefit")
 
 
 # --- rs_error_correction_capacity: hand-computed arithmetic ---------------------------------
