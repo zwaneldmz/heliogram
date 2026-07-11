@@ -261,6 +261,19 @@ This section describes the `subpatch=1` (default) case, i.e. one symbol per data
 3. Grid size: `width = max(P, ceil(sqrt(num_symbols)))`, `data_rows = ceil(num_symbols / width)`,
    `height = data_rows + 1` (the `+1` is the calibration row). This is the smallest roughly-square
    grid, subject to `width >= P`, that can hold `num_symbols` data-patch symbols.
+
+   *Grid-size selection freedom (`align`, added post-v0.1.0, wire-compatible):* an encoder MAY
+   select a LARGER grid than the formula above -- `encode(..., align=n)` rounds `width` and
+   `height` each up to a multiple of `n` patches. This is not a format change: a decoder reads
+   the grid dimensions off the image itself (section 7), symbols still fill data patches
+   row-major, and the extra capacity is ordinary trailing symbol-`0` padding per step 4 below,
+   which the decoder already skips (it reads only `ecc_len` bytes' worth of symbols). The
+   motivating value is `align=2`: pixel dimensions become multiples of `2 * patch_size` (28px at
+   the default 14px patch), which the pinned Phase-2 target's (Qwen2.5-VL) mandatory
+   `smart_resize` preprocessing passes through unchanged instead of resampling off the symbol
+   lattice -- see `heliogram.corruption.qwen_smart_resize` and RESULTS.md's qwen_smart_resize
+   corruption rows for the measured cost of NOT aligning. `align=1` (the default) reproduces the
+   formula above byte-for-byte.
 4. The `num_symbols` symbols are written into data patches (all patches in rows `1..height-1`)
    row-major. Any remaining data patches (`width * (height - 1) - num_symbols`, which is 0 when
    `num_symbols` happens to fill the grid exactly) are set to symbol value `0`.

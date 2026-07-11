@@ -180,10 +180,22 @@ def rs_encoded_length(message_len: int, nsym: int, nsize: int = RS_NSIZE) -> int
     return message_len + num_chunks * nsym
 
 
-def compute_grid(num_symbols: int, palette: int) -> Tuple[int, int]:
+def compute_grid(num_symbols: int, palette: int, align: int = 1) -> Tuple[int, int]:
     """Smallest roughly-square (width, height) patch grid whose data patches (every row after
     row 0) can hold `num_symbols` symbols, with width >= palette so every calibration color
     appears at least once in row 0.
+
+    `align` (default 1: no constraint, byte-identical to every prior release) rounds BOTH grid
+    dimensions up to a multiple of `align` patches. `align=2` makes the pixel dimensions
+    multiples of `2 * patch_size` = 28px for the default 14px patch -- exactly the snap unit of
+    Qwen2/2.5-VL's `smart_resize` preprocessing (see heliogram.corruption.qwen_smart_resize),
+    so the model's own mandatory resize becomes the identity on the encoded image. This is NOT
+    a wire-format change: the wider/taller grid is an already-legal v0.1 grid, the extra cells
+    are ordinary trailing padding (`encode` zero-fills unused capacity), and any decoder reads
+    the grid size off the image itself -- `decode_pixels` round-trips aligned output bit-exactly
+    with no flag. Contrast with heliogram.dataset.pad_to_even_patch_grid, which patches pixels
+    AFTER layout and therefore breaks decode round-trip whenever it adds a COLUMN (documented
+    there); aligning the grid BEFORE layout has no such caveat.
 
     This function itself has no notion of sub-patch packing (see `encode`'s `subpatch` param):
     `num_symbols` here means "count of things laid out row-major across data patches, one per
@@ -191,9 +203,13 @@ def compute_grid(num_symbols: int, palette: int) -> Tuple[int, int]:
     DATA-PATCH count (`ceil(total_symbols / k**2)`), not the raw total-symbol count.
     """
     _check_palette(palette)
+    if align < 1:
+        raise ValueError(f"align must be >= 1, got {align!r}")
     width = max(palette, math.ceil(math.sqrt(max(num_symbols, 1))))
+    width = math.ceil(width / align) * align
     data_rows = max(1, math.ceil(num_symbols / width))
     height = data_rows + 1  # +1 for the calibration row
+    height = math.ceil(height / align) * align
     return width, height
 
 
@@ -234,6 +250,7 @@ def encode(
     nsym: int = 32,
     seed: int = 0,
     subpatch: int = 1,
+    align: int = 1,
 ) -> Image.Image:
     """Encode `data` as a heliogram codec v0.1 image. Deterministic: identical arguments always
     produce a pixel-identical image (the palette/layout have no randomness; `seed` is accepted
@@ -242,6 +259,15 @@ def encode(
     PNG encoder is not itself pinned by this project), so pin img.tobytes() (plus size/mode), not
     a PNG-byte hash, if you need a byte-for-byte determinism guard; see
     tests/test_roundtrip.py::test_subpatch1_output_unchanged_pinned_hash.
+
+    `align` (default 1: byte-identical to every prior release) rounds the patch grid's width and
+    height up to a multiple of `align` patches BEFORE layout -- see `compute_grid`'s docstring.
+    `align=2` emits images whose pixel dimensions are multiples of 28px (at the default 14px
+    patch), which Qwen2/2.5-VL's mandatory `smart_resize` preprocessing passes through untouched
+    (subject to its min/max_pixels budget) -- the encode-side fix for the misalignment corruption
+    the harness's `qwen_smart_resize` rows measure. Decode needs no flag: the aligned grid is an
+    ordinary, legal v0.1 grid with more trailing padding, and `decode_pixels` round-trips it
+    bit-exactly (pinned in tests/test_smart_resize.py).
 
     `subpatch` (k, default 1) subdivides each DATA patch into a k x k grid of `patch_size/k`-px
     solid-color sub-cells, each carrying one symbol -- k*k symbols per data patch instead of 1.
@@ -271,7 +297,7 @@ def encode(
     k = subpatch
     cells_per_patch = k * k
     data_patches_needed = math.ceil(num_symbols / cells_per_patch)
-    width, height = compute_grid(data_patches_needed, palette)
+    width, height = compute_grid(data_patches_needed, palette, align=align)
     data_patches = width * (height - 1)
     capacity = data_patches * cells_per_patch
     symbols = symbols + [0] * (capacity - num_symbols)

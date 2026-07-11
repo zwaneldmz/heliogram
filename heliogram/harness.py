@@ -95,7 +95,15 @@ from .codec import (
     extract_symbols,
     rs_encoded_length,
 )
-from .corruption import compose, crop_pad, jpeg_compress, resize_roundtrip
+from .corruption import (
+    QWEN_DEFAULT_MAX_PIXELS,
+    QWEN_GENEROUS_MAX_PIXELS,
+    compose,
+    crop_pad,
+    jpeg_compress,
+    qwen_smart_resize,
+    resize_roundtrip,
+)
 
 PALETTES = VALID_PALETTES  # currently (2,4,8,16,32,64,128,256) -- tracks codec.VALID_PALETTES
 NSYM = 32
@@ -175,6 +183,25 @@ CORRUPTIONS: Dict[str, Callable] = {
     "jpeg_q85": lambda img: jpeg_compress(img, quality=85),
     "jpeg_q70": lambda img: jpeg_compress(img, quality=70),
     "crop_pad_2px": lambda img: crop_pad(img, dx=2, dy=2),
+    # The target model's OWN preprocessing (Qwen2/2.5-VL smart_resize) -- the one corruption an
+    # in-scope operator cannot opt out of. Two variants, measured separately on purpose:
+    #   qwen_smart_resize      operator-controlled pixel bounds (generous max_pixels, as
+    #                          scripts/run_probe.py sets): what remains is the UNAVOIDABLE 28px
+    #                          (patch*merge) dimension snap. Identity for even-patch-grid images
+    #                          under ~16M px; resamples any grid with an odd patch dimension.
+    #   qwen_smart_resize_1mp  the STOCK processor defaults (max_pixels=1,003,520): a naive
+    #                          operator's pipeline additionally downscales any grid over ~1MP
+    #                          wholesale. This is what "just feed it to the processor" does.
+    # These are the DOCUMENTED same-size-contract exception (see heliogram.corruption's module
+    # docstring): the corrupted image may have a different size -- _run_cell measures it at that
+    # size, exactly as the model would see it, rather than resizing back (which would erase the
+    # corruption being measured).
+    "qwen_smart_resize": lambda img: qwen_smart_resize(
+        img, max_pixels=QWEN_GENEROUS_MAX_PIXELS
+    ),
+    "qwen_smart_resize_1mp": lambda img: qwen_smart_resize(
+        img, max_pixels=QWEN_DEFAULT_MAX_PIXELS
+    ),
     # "combined": the composed worst-case suite the README's "Corrupted" column describes --
     # resize 5%, JPEG q70, and a 2px crop/pad applied in sequence to the SAME image.
     "combined": lambda img: compose(
@@ -424,8 +451,14 @@ def _run_cell(
             payload, palette=palette, patch_size=PATCH_SIZE, nsym=NSYM, seed=0, subpatch=subpatch
         )
         corrupted_img = corruption_fn(clean_img)
-        if corrupted_img.size != clean_img.size:
-            corrupted_img = corrupted_img.resize(clean_img.size)
+        # NO resize-back when a corruption changed the image size: the only size-changing
+        # corruptions in this suite are the qwen_smart_resize entries, whose entire measured
+        # effect IS the size change (the model sees the resized image at its own patch grid --
+        # resizing back would erase the corruption). An earlier version of this loop resized
+        # any size-changed output back to clean_img.size as a guard against caller-supplied
+        # corruption fns; that guard is gone -- decode_pixels/extract_symbols derive the patch
+        # grid from the image's ACTUAL size, so a size-changed image is measured exactly as a
+        # model would see it (usually: misaligned grid -> decode failure, reported as such).
 
         _, _, truth = extract_symbols(
             clean_img, palette=palette, patch_size=PATCH_SIZE, subpatch=subpatch
@@ -433,6 +466,9 @@ def _run_cell(
         _, _, observed = extract_symbols(
             corrupted_img, palette=palette, patch_size=PATCH_SIZE, subpatch=subpatch
         )
+        # When a size-changing corruption altered the patch-grid shape, positional comparison
+        # below is only meaningful over the overlapping prefix (and near-meaningless even there
+        # -- rows have shifted); decode_success_rate is the honest headline for those cells.
         n = min(len(truth), len(observed))
         symbol_errors += sum(1 for i in range(n) if truth[i] != observed[i])
         symbol_total += n
@@ -1046,12 +1082,53 @@ def _token_crossover_section(
     return lines
 
 
+def _resolve_text_baselines() -> object:
+    """Resolve the OPTIONAL multi-encoding text baseline (heliogram.baselines.
+    load_measured_text_baselines) -- the measurement that answers 'is base64 even the right
+    bar?'. Same defensive-getattr pattern as _resolve_base64_baseline, same soft-absence
+    contract: returns None when no measurement file exists, and callers must then say the bar
+    is base64-only (a caveat), never invent a stronger number."""
+    loader = getattr(_baselines_module, "load_measured_text_baselines", None)
+    if loader is None:
+        return None
+    return loader()
+
+
 def write_results_md(
     results: List[CellResult],
     path: Path,
     stress_results: Optional[List[CellResult]] = None,
 ) -> None:
     baseline = _resolve_base64_baseline()
+    text_baselines = _resolve_text_baselines()
+    # Is base64 actually the strongest way to ship bytes as text on this tokenizer? This project
+    # was burned once by an under-measured baseline (analytic 6.0 -> measured 8.096 flipped every
+    # verdict); this block keeps the same error from recurring with base64-vs-better-encodings.
+    if text_baselines is not None:
+        _strongest = text_baselines.strongest
+        if _strongest.bits_per_token > baseline.bits_per_token + 1e-9:
+            bar_a_qualifier = (
+                f" **MEASURED CAVEAT: the strongest measured text encoding on this tokenizer "
+                f"is `{_strongest.encoding}` at {_strongest.bits_per_token:.3f} bits/token, "
+                "ABOVE the base64 bar -- every Bar A verdict below UNDERSTATES the true "
+                "text-context break-even by that margin; see Baselines.**"
+            )
+        else:
+            bar_a_qualifier = (
+                f" (Cross-checked against {len(text_baselines.encodings)} measured text "
+                f"encodings: the strongest is `{_strongest.encoding}` at "
+                f"{_strongest.bits_per_token:.3f} bits/token, so the base64 bar IS the "
+                "operative text-context bar on this tokenizer, not an understatement.)"
+            )
+    else:
+        bar_a_qualifier = (
+            " **UNMEASURED CAVEAT: no multi-encoding text-baseline measurement exists in this "
+            "checkout (heliogram/data/text_baselines.json missing), so whether base64 is even "
+            "the strongest reasonable text encoding on this tokenizer is UNKNOWN -- a stronger "
+            "one (ascii85/base85) would raise this bar further. Run `python -m "
+            "heliogram.baselines --measure` (needs transformers + HF Hub access) to close "
+            "this.**"
+        )
     sample_payload = _random_payload(0, PAYLOAD_SIZE)
     rendered = rendered_text_density(sample_payload, patch_size=PATCH_SIZE)
     summary = _summary_rows(results)
@@ -1113,7 +1190,8 @@ def write_results_md(
         "minimum for heliogram to be worth considering purely on density. Evaluated CLEAN "
         f"only in the table below (see the 'beats {BASE64_BITS_PER_TOKEN:.0f} clean?' column); "
         "a config beating Bar A clean may or may not survive corruption -- the worst-corruption "
-        "columns in the same row show that separately, and it is not folded into this bar.",
+        "columns in the same row show that separately, and it is not folded into this bar."
+        + bar_a_qualifier,
         f"- **Bar B -- Gate #1 comfort margin ({GATE_BITS_PER_PATCH:.1f} bits/patch, clean AND "
         "worst-tested-corruption):** originally set as a robustness margin ABOVE Bar A "
         "before this project starts Phase 2 (see the README's Decision Gate). A config \"clears "
@@ -1266,6 +1344,33 @@ def write_results_md(
         "conservative AGAINST heliogram's claim). The old version of this section documented a "
         "Bar A/Bar C asymmetry here (Bar C stuck on the analytic ~1-char/token estimate even "
         "when a measurement existed); that asymmetry is now closed.",
+        (
+            "- **Other text encodings (is base64 even the right bar?):** "
+            + (
+                f"MEASURED ({text_baselines.tokenizer_id}, "
+                f"{text_baselines.tokenizer_package}): "
+                + ", ".join(
+                    f"`{e.encoding}` {e.bits_per_token:.3f} bits/token "
+                    f"({e.chars_per_token:.4f} chars/token)"
+                    for e in sorted(
+                        text_baselines.encodings.values(),
+                        key=lambda e: e.bits_per_token,
+                        reverse=True,
+                    )
+                )
+                + f". The strongest (`{text_baselines.strongest.encoding}`) is the honest "
+                "text-context economic bar; the Bar A verdicts above are computed against "
+                "base64 and carry the qualifier stated there."
+                if text_baselines is not None
+                else "NOT MEASURED in this checkout (heliogram/data/text_baselines.json "
+                "missing). base64 is the only measured text encoding, and it is NOT "
+                "guaranteed to be the strongest on this tokenizer -- ascii85/base85 pack 8 "
+                "bits into 1.25 chars vs base64's 1.33 before BPE effects. Until "
+                "`python -m heliogram.baselines --measure` (transformers + HF Hub access "
+                "required) is run, every Bar A verdict above should be read as 'beats "
+                "base64', not 'beats text context'."
+            )
+        ),
         f"- **Rendered text (geometric, model-free):** {rendered.chars_per_patch:.2f} "
         f"chars/patch = {rendered.bits_per_patch:.2f} bits/patch typesetting a "
         f"{PAYLOAD_SIZE}-byte payload (base64'd, {rendered.text_len} chars) into "
@@ -1288,7 +1393,8 @@ def write_results_md(
         "bits/patch should rise toward the `subpatch²·log2(palette)` ceiling as payload "
         "grows -- this is the amortization half of this sweep. 'corr(mean)' is the mean "
         "bits/patch over every non-clean corruption in the table below (resize 3%/5%, JPEG "
-        "q95/85/70, crop/pad 2px, combined), each counted as 0 on a failed decode.",
+        "q95/85/70, crop/pad 2px, the model's own preprocessing qwen_smart_resize / "
+        "qwen_smart_resize_1mp, and combined), each counted as 0 on a failed decode.",
         "",
     ]
     for subpatch in subpatches_present:
@@ -1402,7 +1508,8 @@ def write_results_md(
     if min_success >= 1.0 - 1e-9:
         absorption_note = (
             "Within the realistic corruption envelope this harness applies (resize +-1-5%, "
-            f"JPEG q70-95, slight crop/pad, and their composition), decode_success_rate is "
+            f"JPEG q70-95, slight crop/pad, the model's own smart_resize preprocessing, and "
+            "their composition), decode_success_rate is "
             f"1.00 for every cell in this sweep -- Reed-Solomon (nsym={NSYM}) fully absorbs "
             "the symbol errors this envelope introduces at every tested (palette, subpatch, "
             "payload_size) combination, including the larger palettes/subpatch=2/bigger-"
