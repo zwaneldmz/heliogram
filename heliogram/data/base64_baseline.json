@@ -1,0 +1,23 @@
+{
+  "bits_per_token": 8.096385542168674,
+  "chars_per_token": 1.3497740963855422,
+  "measured_note": "measured: Qwen/Qwen2.5-VL-7B-Instruct tokenizer (transformers==5.13.0), 3 payload sizes x 3 seeds each = 9 base64 samples ([1024, 4096, 16384] bytes, seeds [0, 1, 2]), 63744 tokens total for 516096 bits of original payload -> 8.0964 bits/token (1.3498 base64 chars/token, 1011.81 tokens/KB). Compare to the 6.0 bits/token analytic default (base64_bits_per_token()): HIGHER than 6.0 means the analytic estimate was favorable to heliogram's economic claim -- BPE merges commonly give base64 text MORE than 1 char/token, which pushes bits/token below the naive log2(64)=6 estimate.",
+  "per_size": {
+    "1024": 8.078895463510849,
+    "16384": 8.0958616429895,
+    "4096": 8.102868447082097
+  },
+  "sample_sizes": [
+    1024,
+    4096,
+    16384
+  ],
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "tokenizer_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "tokenizer_package": "transformers==5.13.0",
+  "tokens_per_kb": 1011.8095238095239
+}
