@@ -315,3 +315,91 @@ def test_typography_default_geometry_unchanged_by_align_param():
     assert default.image.size == explicit1.image.size
     assert default.total_patches == explicit1.total_patches
     assert default.bits_per_patch == explicit1.bits_per_patch
+
+
+# --- run_typography_ocr._verdict: read-vs-decode distinction (regression for the confounded run)
+
+
+def _load_runner():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "run_typography_ocr_mod", Path(__file__).resolve().parent.parent / "scripts" / "run_typography_ocr.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Geom:
+    def __init__(self, bpp, beats):
+        self.bits_per_patch_rs = bpp
+        self.beats_ascii85_bar = beats
+
+
+class _Ocr:
+    def __init__(self, cer, decode):
+        self.mean_cer = cer
+        self.decode_success_rate = decode
+
+
+class _Bars:
+    ascii85_bits_per_token = 8.374
+
+
+def _mk(fonts, geom_beats, cer, decode):
+    geom = {fs: _Geom(bpp, beats) for fs, (bpp, beats) in geom_beats.items()}
+    ocr = {(fs, True): _Ocr(cer[fs], decode[fs]) for fs in fonts}
+    return fonts, geom, ocr, _Bars()
+
+
+def test_verdict_dead_for_compression_when_reads_but_curves_cross_low():
+    """The actual v2 GPU run: tower reads at big fonts (low CER) but those sizes are far below
+    the bar, and the bar-beating size is illegible. Must NOT say 'cannot read at all'."""
+    m = _load_runner()
+    fonts = [28, 20, 12]
+    v = m._verdict(*_mk(
+        fonts,
+        {28: (1.9, False), 20: (3.7, False), 12: (9.8, True)},
+        {28: 0.04, 20: 0.15, 12: 0.60},
+        {28: 0.0, 20: 0.0, 12: 0.0},
+    ))
+    assert "DEAD for compression" in v
+    assert "real OCR, not blindness" in v  # explicitly denies the 'blind' misreading
+
+
+def test_verdict_dead_illegible_only_when_even_large_fonts_unread():
+    m = _load_runner()
+    fonts = [28, 12]
+    v = m._verdict(*_mk(
+        fonts,
+        {28: (1.9, False), 12: (9.8, True)},
+        {28: 0.6, 12: 0.9},   # illegible even at 28px
+        {28: 0.0, 12: 0.0},
+    ))
+    assert "DEAD (illegible)" in v
+
+
+def test_verdict_promising_when_reads_at_bar_but_encoding_blocks_decode():
+    m = _load_runner()
+    fonts = [12]
+    v = m._verdict(*_mk(
+        fonts,
+        {12: (9.8, True)},
+        {12: 0.03},   # reads the bar-beating size well
+        {12: 0.0},    # but encoding doesn't decode
+    ))
+    assert "PROMISING" in v and "ENCODING" in v.upper()
+
+
+def test_verdict_real_when_bar_beating_size_decodes():
+    m = _load_runner()
+    fonts = [12]
+    v = m._verdict(*_mk(
+        fonts,
+        {12: (9.8, True)},
+        {12: 0.02},
+        {12: 0.8},   # decodes a majority of trials
+    ))
+    assert "REAL" in v

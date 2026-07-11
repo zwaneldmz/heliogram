@@ -88,6 +88,19 @@ from heliogram.typography import (  # noqa: E402 -- no heavy deps
 # "this is a real, repeatable signal worth a fine-tune's investment", not for "ready to ship".
 DECISIVE_DECODE_SUCCESS_THRESHOLD = 0.5
 
+# Threshold for "the tower can READ the glyphs at this size at all" -- a mean character error
+# rate (RS-framed variant) below this. This is DELIBERATELY separate from the decode-success
+# threshold above, because the two answer different questions and the first GPU run's confounded
+# verdict proved conflating them is a real honesty bug: a tower can read ~96% of characters
+# correctly (CER 0.04) yet decode 0% of payloads, because ascii85 is positional (one wrong char
+# cascades) and OCR errors include insertions/deletions that Reed-Solomon cannot correct at all
+# (RS fixes substitutions at KNOWN positions, not shifts). So "does not decode" must NOT be
+# reported as "cannot read" -- the CER curve is the readability signal, decode_success is the
+# usability signal, and a run can pass the first while failing the second. 0.10 (90% char
+# accuracy) is a generous "clearly reading, not hallucinating" bar; the exact-match/decode
+# columns carry the stricter usability question.
+DECISIVE_CER_THRESHOLD = 0.10
+
 
 def _parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -219,11 +232,14 @@ def _geometry_by_font_size(payload_size: int, font_sizes, nsym: int, seed: int):
 
 
 def _verdict(font_sizes, geometry, ocr_by_font_and_variant, bars) -> str:
-    """The three-way call this whole experiment exists to make -- see this file's module
-    docstring for the full rule. Reads off `ocr_by_font_and_variant[(font_size, apply_rs=True)]
-    .decode_success_rate` (the ECC-honest variant -- see heliogram.typography's own module
-    docstring for why RS, not raw, is the fair headline figure) and `geometry[font_size]
-    .beats_ascii85_bar`."""
+    """The call this experiment exists to make -- see this file's module docstring. Keys on TWO
+    distinct signals, deliberately not conflated (see DECISIVE_CER_THRESHOLD's comment for why
+    the first GPU run's verdict, which conflated them, was an honesty bug): READS (mean_cer <=
+    DECISIVE_CER_THRESHOLD -- the tower resolves the glyphs) and DECODES (decode_success_rate >=
+    DECISIVE_DECODE_SUCCESS_THRESHOLD -- the transcription actually recovers the payload). Both
+    at the RS-framed variant (the ECC-honest one). A run can READ without DECODING (ascii85 is
+    positional and OCR insertions/deletions defeat RS), and that distinction is the whole point
+    of reporting the CER curve alongside decode success."""
     if bars.ascii85_bits_per_token is None:
         return (
             "VERDICT: UNDETERMINED -- no measured ascii85 text-token bar is available in this "
@@ -232,41 +248,61 @@ def _verdict(font_sizes, geometry, ocr_by_font_and_variant, bars) -> str:
             "measurements, just not yet compared against the economic bar."
         )
 
-    readable = [
+    def _rs(fs):
+        return ocr_by_font_and_variant[(fs, True)]
+
+    reads = [fs for fs in font_sizes if _rs(fs).mean_cer <= DECISIVE_CER_THRESHOLD]
+    decodes = [
         fs
         for fs in font_sizes
-        if ocr_by_font_and_variant[(fs, True)].decode_success_rate
-        >= DECISIVE_DECODE_SUCCESS_THRESHOLD
+        if _rs(fs).decode_success_rate >= DECISIVE_DECODE_SUCCESS_THRESHOLD
     ]
     beats_bar = [fs for fs in font_sizes if geometry[fs].beats_ascii85_bar]
-    overlap = sorted(set(readable) & set(beats_bar))
-    largest = max(font_sizes)
-    largest_ok = largest in readable
+    decode_overlap = sorted(set(decodes) & set(beats_bar))
+    read_overlap = sorted(set(reads) & set(beats_bar))
+    # Best (highest) geometric density among sizes the tower actually READS -- how close the
+    # readable regime gets to the bar, the number that decides whether ENCODING work could ever
+    # matter or whether the density/legibility curves simply cross too low.
+    best_readable_density = max((geometry[fs].bits_per_patch_rs for fs in reads), default=0.0)
+    bar = bars.ascii85_bits_per_token
 
-    if overlap:
+    if decode_overlap:
         return (
-            f"VERDICT: REAL. Font size(s) {overlap}px BOTH clear the measured ascii85 bar "
-            f"(8.374 bits/token) geometrically AND read at decode_success_rate >= "
-            f"{DECISIVE_DECODE_SUCCESS_THRESHOLD:.0%} zero-shot (RS-framed variant) -- the "
-            "typography pivot's density economics are backed by real stock-model readability, "
-            "not merely a geometric assumption. This is still a ZERO-SHOT floor, not a "
-            "production result -- fine-tuning should only improve on this."
+            f"VERDICT: REAL. Font size(s) {decode_overlap}px BOTH clear the measured ascii85 bar "
+            f"({bar:.3f} bits/token) geometrically AND recover the payload at decode_success_rate "
+            f">= {DECISIVE_DECODE_SUCCESS_THRESHOLD:.0%} zero-shot (RS-framed) -- the pivot's "
+            "density economics are backed by real stock-model readability. A ZERO-SHOT floor; "
+            "fine-tuning should only improve it."
         )
-    if not largest_ok:
+    if read_overlap:
         return (
-            f"VERDICT: DEAD. Even the largest swept font size ({largest}px) does not reliably "
-            f"transcribe (decode_success_rate < {DECISIVE_DECODE_SUCCESS_THRESHOLD:.0%}, RS "
-            "variant) -- the stock tower cannot read this dense a typeset rendering at all, at "
-            "any size tested here. Larger font sizes (lower density, easier geometry) would need "
-            "to be swept to fully rule this out, but the typography pivot has no support from "
-            "this run."
+            f"VERDICT: PROMISING (encoding-limited). Font size(s) {read_overlap}px clear the "
+            f"{bar:.3f} bits/token bar AND the tower READS them (CER <= "
+            f"{DECISIVE_CER_THRESHOLD:.0%}), but they do not DECODE at these sizes -- the "
+            "bottleneck is the ENCODING (ascii85 is positional; OCR insertions/deletions defeat "
+            "Reed-Solomon), not the tower's perception. An OCR-robust code (fixed-width per-line "
+            "framing, a lookalike-free alphabet, synchronization markers) is the next bounded "
+            "experiment -- the geometry and the raw reading are both already there."
+        )
+    if not reads:
+        return (
+            f"VERDICT: DEAD (illegible). No swept font size -- down to the largest, "
+            f"{max(font_sizes)}px -- is even READ (every size has mean CER > "
+            f"{DECISIVE_CER_THRESHOLD:.0%}, RS variant). The stock tower cannot resolve this "
+            "typeset rendering at any tested size; the failure is perception, not encoding."
         )
     return (
-        f"VERDICT: NEEDS FINE-TUNING. Readable font size(s) {sorted(readable)}px do not overlap "
-        f"with the font size(s) {sorted(beats_bar)}px that clear the 8.374 bits/token bar "
-        "geometrically -- the stock tower can read this rendering, just not yet small/dense "
-        "enough for the economics to work. A fine-tune targeting exactly the gap between these "
-        "two font-size sets is the next decisive, bounded experiment."
+        "VERDICT: DEAD for compression (readability and density do not overlap). The stock tower "
+        f"DOES read this rendering at large fonts (sizes {sorted(reads)}px have mean CER <= "
+        f"{DECISIVE_CER_THRESHOLD:.0%} -- real OCR, not blindness), but every size it reads is "
+        f"far below the {bar:.3f} bits/token bar (best readable density {best_readable_density:.2f} "
+        f"bits/patch), while the size(s) that clear the bar ({sorted(beats_bar)}px) are too small "
+        "to read. Density and legibility are inversely coupled through font size and cross BELOW "
+        "the economic bar, so even a perfect-decoding encoding at a readable size costs more "
+        "tokens than sending the text -- the same reason optical compression pays off for "
+        "redundant PROSE (DeepSeek-OCR/Glyph) but not for high-entropy arbitrary bytes, where "
+        "every character must be exact. Encoding robustness cannot move the geometry; only a "
+        "model that reads far smaller text could, which this zero-shot run measures it does not."
     )
 
 
@@ -337,9 +373,11 @@ def _write_report(
     lines.append("")
     lines.append(
         "`identity?` = did the processor's mandatory smart_resize step reproduce this font "
-        "size's rendered canvas exactly (no); `no` means this row's OCR call went through an "
-        "extra uncontrolled resize on top of the rendering -- see "
-        "_assert_identity_preprocessing's docstring."
+        "size's rendered canvas exactly. `yes` (expected, since heliogram.ocr_eval renders on a "
+        "28px-aligned align=2 canvas) means the model graded the rendering itself; `no` means "
+        "this row's OCR call went through an extra uncontrolled resize on top of the rendering "
+        "and its CER/decode numbers are NOT trustworthy -- see _assert_identity_preprocessing's "
+        "docstring."
     )
     lines.append("")
     lines.append("## Verdict")

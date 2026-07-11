@@ -253,6 +253,46 @@ a future model — not a demonstrated exploit.
   because their preprocessing is opaque and changeable (`README.md`,
   "Scope").
 
+## 5b. The typography alternative, also measured dead (for a different reason)
+
+The natural pivot from the failed color codec is to render the payload as dense
+typeset text — the channel VLM towers demonstrably *do* read (DeepSeek-OCR,
+Glyph). `heliogram.typography` first confirmed the geometric prerequisite:
+RS-framed ascii85 text on the 14px patch grid clears the 8.374 bits/token bar
+from a 12px font down (assuming perfect legibility). `heliogram.ocr_eval` +
+`scripts/run_typography_ocr.py` then measured the readability that geometry
+assumes away, running a stock Qwen2.5-VL zero-shot over the rendered images
+(28px-aligned so the tower's own `smart_resize` is the identity — an earlier
+run that skipped this alignment measured a resampled image and was discarded).
+
+Measured (7B, zero-shot, RS-framed, 256B payload, mean character error rate):
+
+| font | CER | reads? | geom bits/patch | beats 8.374? |
+|---:|---:|---|---:|---|
+| 28px | 0.041 | yes (~96%) | 1.94 | no |
+| 24px | 0.074 | yes | 2.56 | no |
+| 20px | 0.152 | mostly | 3.71 | no |
+| 16px | 0.370 | poorly | 5.84 | no |
+| 14px | 0.467 | badly | 7.42 | no |
+| 12px | 0.595 | no | 9.75 | **yes** |
+
+The tower **can** OCR rendered ascii85 — 96% character accuracy at 28px — so
+this is not a perception failure like the color codec. It is a geometric one:
+**readability and density are inversely coupled through font size and cross
+below the economic bar.** The sizes the tower reads (≥24px) sit at ~2 bits/patch,
+roughly 4× *below* the bar; the only size that beats the bar (12px) is
+illegible (60% CER). Even a perfect-decoding encoding at a readable size would
+cost more tokens than sending the text itself. No encoding cleverness moves the
+geometry — only a model that reads far smaller text would, and this run
+measures that the stock tower does not. This is the same reason optical
+compression pays off for redundant *prose* (where the LM prior fills OCR gaps)
+but not for the high-entropy arbitrary bytes heliogram targets, where every
+character must be exact. (`decode_success` was 0% at every size, but that
+number is dominated by ascii85's positional brittleness — one OCR
+insertion/deletion defeats Reed–Solomon — and is *not* the reason for the
+verdict; the readability/density crossing is, and it holds regardless of
+encoding.)
+
 ## 6. What would make this a stronger result
 
 The single measurement that would resolve the open question on both sides —
