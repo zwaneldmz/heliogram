@@ -4,7 +4,9 @@
 
 **[Read the full findings writeup →](docs/FINDINGS.md)** — the measured economic
 result, the frozen-tower probe mechanism, and the defensive contribution, in one
-place.
+place. **[Read the full technical report →](docs/writeup.md)** — the same
+material as a standalone, paper-style report with background/related work,
+methods, and discussion sections.
 
 heliogram is a patch-aligned optical codec plus an evaluation harness. It encodes
 arbitrary bytes as a grid of solid-color 14x14 blocks (one symbol per ViT patch),

@@ -1,5 +1,9 @@
 # heliogram: findings
 
+**For the full-length, paper-style version of this document — background and
+related work, methods, and discussion sections — see
+[`docs/writeup.md`](writeup.md).**
+
 This document summarizes what heliogram actually measured, in one place, for
 readers who want the verdict without the sweep tables. It invents no numbers:
 every quantitative claim below cites the file it comes from. It is a defensive-
