@@ -28,7 +28,13 @@ STATUS=0
 # Extended-regex line filters. Each selects ONLY lines that are pure, deterministic arithmetic or
 # seeded-detector output -- see the module docstrings this script's comment above points to for
 # why these specific lines are safe to pin across Pillow/numpy/Python versions.
-BENEFIT_FILTER='^(heliogram patches|base64 tokens|hex \(raw-byte\) tokens|patches / (base64|hex|raw text) tokens|  ASSUMPTION|  RS correction budget|  within RS budget|  recovered_bit_fraction|  tokens spent|  cost per recovered bit):'
+# NOTE: 'patches / raw text tokens' is deliberately EXCLUDED -- it is the one tokenizer-dependent
+# line (heliogram.benefit._estimate_raw_text_tokens uses the real transformers tokenizer when it
+# is installed, else a ~4-chars/token analytic fallback), so it drifts between a CPU box without
+# transformers and a GPU box with it. Only pure-arithmetic, tokenizer-independent lines belong in
+# a version-stable fixture. Everything below (patch/base64/hex counts and ratios, RS budget, the
+# assumption-flagged effective-cost rows) is exact arithmetic.
+BENEFIT_FILTER='^(heliogram patches|base64 tokens|hex \(raw-byte\) tokens|patches / (base64|hex) tokens|  ASSUMPTION|  RS correction budget|  within RS budget|  recovered_bit_fraction|  tokens spent|  cost per recovered bit):'
 FOREIGN_TILE_FILTER='^TPR='
 TYPOGRAPHY_FILTER='^VERDICT:'
 
