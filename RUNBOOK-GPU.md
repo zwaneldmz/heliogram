@@ -118,6 +118,52 @@ Decision rules for (c), the one that decides step 7:
 If (a) shows the 7B tower passing where 3B failed, prefer switching the whole Phase-2 target
 to 7B over any amount of 3B fine-tuning.
 
+### Session-2 verdict (2026-07, reports committed at repo root)
+
+All three follow-ups ran. Measured outcomes against the table above:
+
+- **(a) 7B escalation: FAILED.** Merged-stage clean error 65.5% (P=16) / 89.8% (P=256) —
+  marginally better than 3B, nowhere near the 6.3% budget. Scale does not rescue the
+  merged-token branch; the escalation clause is exhausted.
+- **(b) Easy mode: pipeline validated, economics not.** P=2 merged reads at 18.3% error
+  (81.7% binary accuracy) — the probe/labels/ordering provably work end to end, and the
+  tower does carry coarse color. But even binary is ~3× over budget, and readability
+  collapses with palette size (P=2: 18% → P=4: 33% → P=16: 66% → P=256: 90%).
+- **(c) Pre-merger localization: SPLIT verdict, and it decides step 7.**
+  - `P=16 / clean`: **13.4% error** (train 0.2%) vs 73.6% post-merger — the vision blocks
+    largely PRESERVE 16-color identity and **the merger MLP is what destroys it** (a ~5×
+    error blow-up across one layer). `jpeg_q70`: 19.0% — corruption costs ~6 points
+    pre-merger, consistent with the bayes_bound pixel-level headroom finding.
+  - `P=256 / clean`: **80.8% error even pre-merger** — the vision BLOCKS already discard
+    fine color identity. Per the decision table: for the large palettes, nothing
+    downstream (merger, LM, LoRA on either) can recover what never arrives.
+
+**Step-7 decision: the ORIGINAL step 7 (large-palette curriculum, P∈{64,128,256}) is
+DEAD — do not run it.** Its entire premise (a learned reader recovering large-palette
+color through corruption) requires information the tower's own blocks are measured to
+discard before the merger. The one live, narrower option is a P=16-RETARGETED experiment
+(merger-focused fine-tune; prize ≈ 16 bits/LM-token ≈ 1.9× the measured ascii85 text bar)
+— gated on the two cheap scans below coming back favorable:
+
+```bash
+# (d) is P=16's 13.4% data-limited? (train error was 0.2% -- classic small-sample gap)
+python scripts/run_probe.py --model-id Qwen/Qwen2.5-VL-3B-Instruct \
+    --probe-stage pre_merger --palettes 16 --corruptions clean,jpeg_q70 \
+    --n-train-images 24 --n-test-images 8 \
+    --out probe_report_premerger_p16_big.md --json probe_report_premerger_p16_big.json
+
+# (e) where is the pre-merger palette cliff? (16 -> 13%; 256 -> 81%; map the middle)
+python scripts/run_probe.py --model-id Qwen/Qwen2.5-VL-3B-Instruct \
+    --probe-stage pre_merger --palettes 32,64 --corruptions clean \
+    --n-train-images 12 --n-test-images 4 \
+    --out probe_report_premerger_cliff.md --json probe_report_premerger_cliff.json
+```
+
+Read (d) as: error trending toward the 6.3% budget with more data → a merger-targeted
+fine-tune has a credible shot and a retargeted P=16 curriculum is worth its ~$15–40;
+stuck at ~13% → even the narrow case rests on a nonlinear readout the probe can't see —
+possible, but bet accordingly. (e) sets the max economical palette if (d) passes.
+
 ## 3. Optional: stock-model zero-shot floor (~30 min)
 
 Before fine-tuning, measure what the *unmodified* model does, so the fine-tune has a real
