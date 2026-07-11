@@ -1,10 +1,15 @@
 # heliogram
 
-**A patch-aligned optical codec for arbitrary bytes, and a careful measurement of
-whether it can make encoded images a cheaper context medium than text for
-self-hosted vision-language models. The measured answer, on two independent
-channels, is no — this repository is that negative result, with the mechanism
-localized and the honest byproducts kept.**
+**Primarily, this is a defensive-security research artifact: a structural,
+model-free pre-ingest detector for heliogram-like payloads (now with a measured
+adversarial blind spot), a threat model scoped to Qwen2.5-VL, and a reusable
+information-localization probe method for finding where a patch-merging
+vision-language model loses structured per-patch signal. Building those
+instruments started from an economic question — could a patch-aligned optical
+codec make encoded images a cheaper context medium than text for self-hosted
+VLMs? — and the measured answer, on two independent channels, is no. That
+negative result is kept here in full, as the secondary result that motivated
+the instruments above.**
 
 heliogram encodes arbitrary bytes as a grid of solid-color 14×14 blocks (one
 symbol per ViT patch), protects them with Reed–Solomon ECC, runs them through the
@@ -14,13 +19,22 @@ model-free reference decoder, then through a real, frozen Qwen2.5-VL vision towe
 The hypothesis was that a code *designed for the patch channel*, with explicit
 ECC instead of a language model's implicit denoising, might carry high-entropy
 bytes more cheaply than base64/ascii85 text does. It does not, and the repository
-documents why, in the same measured, caveat-attached style throughout.
+documents why, in the same measured, caveat-attached style throughout. That same
+measurement work — recovering a tower's own window-shuffle permutation from its
+outputs, tapping both sides of the patch merger, and scoring linear-probe error
+against a task-derived decision budget — is what generalizes into the reusable
+probe method above; and the exact structural signature the codec produces
+(even patch tiling, near-solid cells) is what the pre-ingest detector in
+[`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) is built to catch.
 
-If you want the verdict without the sweep tables, read
+If you want the verdict on the economic question without the sweep tables, read
 [`docs/FINDINGS.md`](docs/FINDINGS.md). For the full paper-style version with
 background, methods, and discussion, read [`docs/writeup.md`](docs/writeup.md).
-The raw measurement logs are in [`RESULTS.md`](RESULTS.md) and `results.csv`; the
-wire format is [`spec/format-v0.1.md`](spec/format-v0.1.md).
+For the defensive framing — what the detector catches, what it measurably does
+not, and what is out of scope — read
+[`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md). The raw measurement logs are in
+[`RESULTS.md`](RESULTS.md) and `results.csv`; the wire format is
+[`spec/format-v0.1.md`](spec/format-v0.1.md).
 
 Apache-2.0. All data is synthetic and seed-deterministic.
 
@@ -74,7 +88,9 @@ probe (`scripts/run_probe.py`, `heliogram/probe.py`) closes that gap: push
 heliogram grids through the stock, frozen Qwen2.5-VL vision tower and train a
 linear probe from token embeddings to ground-truth patch symbols. A probe at or
 below the RS symbol-error budget (6.27%) means the information survives to that
-point; a probe at chance means it does not, and nothing downstream can recover it.
+point; a probe at chance means no *linearly decodable* per-patch signal survives
+to this tap point — a higher-capacity or nonlinear probe could differ (see
+docs/FINDINGS.md §5).
 
 | Tap point | Model | Palette | Corruption | Probe error | RS budget | Chance | Verdict |
 |---|---|---:|---|---:|---:|---:|---|
@@ -194,7 +210,9 @@ Independent of the economic result, and shipped *before* any capability-facing
 work — "detector before capability" — the project built two defensive instruments
 and wrote a release gate. This ordering is deliberate: a reader trained to read
 machine-dense, human-opaque images is exactly what makes image-borne prompt
-injection un-reviewable by a human in the loop, so the detector ships first.
+injection un-reviewable by a human in the loop, so the detector ships first. See
+[`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) for the full breakdown of what
+this detector does and does not catch.
 
 - **`heliogram.instruments.foreign_tile`** — a model-free pre-ingest guard.
   `guard(img, allowlist)` flags an image carrying a heliogram-like payload not on
@@ -202,7 +220,20 @@ injection un-reviewable by a human in the loop, so the detector ships first.
   into near-solid-color patch cells, which natural photos essentially never do by
   accident) plus a decode check. `evaluate_detector` reports TPR at a bounded FPR,
   using "learned-alphabet" tiles built to defeat calibration-from-row-0 recovery
-  as the hard positives. No model import at any scope.
+  as the hard positives — measured at **TPR=1.000, FPR=0.000** (8/8 positives
+  flagged, 0/16 negatives false-flagged). No model import at any scope.
+
+  **Newly measured limitation, stated honestly:** the guard's cheap first-stage
+  filter (a single global variance threshold on within-cell pixel structure) is
+  *not* adversarially robust. A texture-camouflage attack — per-pixel noise
+  dusted on top of an already-foreign tile so its cells still average to the
+  right symbol color but clear the variance threshold — collapses that filter's
+  TPR to **0.000 at the same FPR=0.000** (0/4 positives caught). Run
+  `python -m heliogram.instruments.foreign_tile` to reproduce both numbers
+  directly. This is a measured ceiling of the current heuristic, not an
+  adversarial-robustness claim about the detector as a whole — see
+  [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) for what this does and does not
+  mean for what the detector can be trusted to catch.
 - **`heliogram.instruments.injection_bench`** — the harness pointed at behavioral
   payloads (persona/schema/tool-call). `measure_behavioral_capacity` requires a
   real model and raises without one; the detector-evaluation mode is pure CPU and
@@ -212,10 +243,22 @@ injection un-reviewable by a human in the loop, so the detector ships first.
 **Stated honestly:** behavioral-attack capacity has *not* been measured — there is
 no tuned reader in this repo, and `measure_behavioral_capacity` refuses to run
 without one. What exists is a threat model, a structural detector with a measured
-methodology, and a benchmark harness ready for a future model — not a demonstrated
-exploit. The written release gate (below) was a commitment about what any future
-capability release would be conditioned on; since the fine-tune is not being
-pursued, it stands as a record of the intended ordering, not a pending run.
+methodology and a measured blind spot, and a benchmark harness ready for a future
+model — not a demonstrated exploit. The written release gate (below) was a
+commitment about what any future capability release would be conditioned on;
+since the fine-tune is not being pursued, it stands as a record of the intended
+ordering, not a pending run.
+
+**On the economics, briefly (run `python -m heliogram.benefit` for the full
+accounting, also listed under Reproducing below):**
+`heliogram.benefit` also records a cost-asymmetry note — a vision token is not
+free-equivalent to a text token even at equal count, since it additionally pays
+for a vision-tower forward pass and its own activation footprint that a text
+token never incurs — and an effective-cost-per-recovered-bit figure that is
+explicitly ASSUMPTION-flagged (e.g. 0.149 tokens/bit *if* symbol error sat
+exactly at the RS budget). The stock, frozen tower does not realize that
+assumption: the probe measured post-merger error at/near chance, so the
+realized cost per recovered bit today is undefined/infinite, not 0.149.
 
 The gate committed, before any tuned reader existed, to publishing together: the
 tuned model's measured behavioral capacity; the detector's TPR at bounded FPR
@@ -229,12 +272,28 @@ CPU-only (no GPU or model weights required):
 
 ```bash
 pip install -e .
+make smoke                        # model-free end-to-end check (codec roundtrip +
+                                  # detector + instruments — no GPU or model weights)
 python -m heliogram.harness       # codec/corruption sweep -> RESULTS.md, results.csv
 python -m heliogram.baselines --measure   # text-encoding baselines (needs HF Hub;
                                           # falls back to committed data/text_baselines.json)
 python -m heliogram.typography    # geometric gate for the typography pivot (model-free)
-python -m heliogram.benefit       # exactness argument + token accounting, no model
+python -m heliogram.benefit       # exactness argument + token/cost accounting, no model
+python -m heliogram.instruments.foreign_tile   # pre-ingest detector eval, incl. the
+                                                # measured texture-camouflage blind spot
+                                                # (TPR 1.000 -> 0.000 at the same FPR)
 pytest -q                         # full CPU test suite
+```
+
+The merger-only adapter go/no-go (Task 2 following on from the frozen-tower
+probe) is now **scaffolded** — designed and CPU-testable, but refuses to run
+without a real loaded model/weights, and has not been run against real weights
+in this repo (no GPU here):
+
+```bash
+python scripts/train_merger_adapter.py --help   # design A/B go/no-go scaffold;
+                                                 # every real-run path raises
+                                                 # ValueError on model=None
 ```
 
 GPU-dependent (CUDA GPU + HF Hub access to Qwen2.5-VL weights), for anyone who
@@ -258,11 +317,18 @@ See [`RUNBOOK-GPU.md`](RUNBOOK-GPU.md) for the full GPU procedure. The Phase-2
 fine-tune scaffold (`heliogram/dataset.py`, `scripts/train_qlora.py`,
 `heliogram/vlm.py`) is retained for reproducibility but is **not pursued** — the
 frozen-tower probe already answered its go/no-go in the negative.
+`scripts/train_merger_adapter.py` is a separate, narrower scaffold (the
+merger-only go/no-go: can a *cheaply trained* merger, not just the stock frozen
+one, preserve the pre-merger partial signal?) — designed and CPU-tested, but,
+like the rest of the GPU path, has not been run against real weights here.
 
 ## Repository map
 
 - [`docs/FINDINGS.md`](docs/FINDINGS.md) — the verdict, in one page, with citations.
 - [`docs/writeup.md`](docs/writeup.md) — full technical report.
+- [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) — what the pre-ingest detector
+  catches, what it measurably does not, and what image-borne-injection concerns
+  are out of scope for it.
 - [`RESULTS.md`](RESULTS.md) / `results.csv` — raw measurement sweep.
 - `probe_report*.md` / `.json` — the frozen-tower probe evidence.
 - [`spec/format-v0.1.md`](spec/format-v0.1.md) — the wire format.
