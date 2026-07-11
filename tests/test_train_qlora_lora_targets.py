@@ -21,9 +21,11 @@ from pathlib import Path
 
 import pytest
 
-torch = pytest.importorskip("torch")
-pytest.importorskip("transformers")
-pytest.importorskip("peft")
+from tests.conftest import importorskip_tolerant
+
+torch = importorskip_tolerant("torch")
+importorskip_tolerant("transformers")  # tolerant: skip on a broken torchaudio ABI, not crash
+importorskip_tolerant("peft")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 

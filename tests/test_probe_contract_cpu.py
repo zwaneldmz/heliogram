@@ -23,9 +23,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch")
-transformers = pytest.importorskip("transformers")
-pytest.importorskip("torchvision")  # the 5.x Qwen image processor imports it
+from tests.conftest import importorskip_tolerant
+
+torch = importorskip_tolerant("torch")
+transformers = importorskip_tolerant("transformers")  # tolerant: skip on broken native lib
+importorskip_tolerant("torchvision")  # the 5.x Qwen image processor imports it
 
 from heliogram.codec import PATCH_SIZE  # noqa: E402
 from heliogram.probe import evaluate_cell, merged_token_labels  # noqa: E402

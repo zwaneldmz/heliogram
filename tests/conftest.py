@@ -11,11 +11,35 @@ it was asked to import, which is the actual invariant.
 
 from __future__ import annotations
 
+import importlib
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def importorskip_tolerant(name: str):
+    """Like `pytest.importorskip`, but SKIP (not ERROR) when the module is present-but-broken,
+    not only when it is absent. `pytest.importorskip` catches ImportError only; a native
+    extension that is installed but fails to load -- e.g. a torch/torchaudio ABI mismatch on a
+    prebuilt GPU image (`OSError: .../libtorchaudio.so: undefined symbol ...`) -- raises OSError
+    and would otherwise crash COLLECTION of the whole suite, taking the model-free tests down
+    with it. heliogram never uses such libraries; a broken one in the environment must degrade to
+    a skipped GPU test, not a red suite. Returns the imported module on success."""
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pytest.skip(f"{name} not installed", allow_module_level=True)
+    except OSError as exc:  # present but a native lib failed to load (ABI mismatch, etc.)
+        pytest.skip(
+            f"{name} is installed but failed to load a native library "
+            f"({type(exc).__name__}: {exc}); skipping this GPU-stack test -- fix the environment "
+            "(e.g. `pip uninstall -y torchaudio` for a torch/torchaudio ABI mismatch).",
+            allow_module_level=True,
+        )
 
 
 def assert_import_stays_torch_free(*module_names: str) -> None:
