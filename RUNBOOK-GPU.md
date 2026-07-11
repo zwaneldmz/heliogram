@@ -235,6 +235,52 @@ max_pixels=16_000_000` (or per-image identity bounds) when feeding heliogram gri
 stock processor's ~1MP default budget silently downscales the larger grids — this is now a
 measured corruption row (`qwen_smart_resize_1mp`) in RESULTS.md, not a hypothesis.
 
+## 3.5 Typography readability (Option 2 — does the tower actually OCR dense text?)
+
+Separate from the color-codec branch above (steps 0–4 are about `decode_pixels`/`QwenVLDecoder`
+reading solid-color patches): `heliogram/typography.py` measured a second, independent pivot —
+render the payload as **dense typeset ascii85 text** instead of color blocks, and rely on the
+tower's pretrained OCR competence rather than a learned color classifier. That module's own gate
+is model-free and already passed: RS-framed ascii85 text clears the color codec's 6.996
+bits/patch ceiling at every swept font size, and clears the harder measured ascii85 text-token
+bar (8.374 bits/token, `heliogram/data/text_baselines.json`) from 12px font size down. But that
+number assumes **perfect legibility** — it says nothing about whether a real, un-fine-tuned
+Qwen2.5-VL can actually read text that small. This step answers that, cheaply, before any
+typography-focused fine-tune is considered:
+
+```bash
+python scripts/run_typography_ocr.py \
+    --model-id Qwen/Qwen2.5-VL-7B-Instruct \
+    --font-sizes 14,12,10,8 \
+    --payload-size 256 --n-trials 5 \
+    --out typography_ocr_report.md --json typography_ocr_report.json
+```
+
+**What it measures:** for each font size, renders `--n-trials` random payloads (both raw ascii85
+and RS-framed ascii85, `heliogram.ocr_eval.render_ocr_example` — reusing
+`heliogram.typography`'s renderer, not a separate one) and asks the STOCK model to transcribe
+each one. Reports, per font size: character error rate (CER), exact-match rate, and —
+the metric that actually matters — `decode_success_rate`: the fraction of transcriptions that,
+fed through `recover_payload_from_transcription`, recover the exact original payload bytes.
+Cross-references all of this against the geometric bars from `heliogram.typography` (reused via
+`sweep_typography`/`load_reference_bars`, not recomputed) so readability and density economics
+show up side by side in one table, not two documents a reader has to reconcile by hand.
+
+**Three-way verdict** (printed by the script, and in `typography_ocr_report.md`):
+
+| Observation | Meaning |
+|---|---|
+| some font size both beats 8.374 bits/token geometrically **and** reads at a CER low enough to RS-decode reliably (`decode_success_rate` clears the script's 50% threshold) | **REAL** — the pivot's density economics are backed by actual stock-model readability, not just a geometric assumption. A fine-tune only has to improve on a working zero-shot floor. |
+| readability only holds at font sizes too big to beat the bar (the tower can read the text, just not small/dense enough for the economics to work) | **NEEDS FINE-TUNING** — a targeted fine-tune aimed at exactly the gap between "readable" and "dense enough" is the next bounded experiment. |
+| even the largest swept font size (14px, deliberately kept as an "should read trivially" control) fails to transcribe reliably | **DEAD** — the tower cannot OCR this alphabet/layout at all; no fine-tune rescues a channel the tower cannot perceive in the first place. |
+
+**Cost and status:** this is a **zero-shot** run (no training, no adapter) — cheap (~$1–2 of GPU
+time for the default sweep) and decisive: a clean fail here kills the typography pivot before any
+GPU-hours are spent on a typography-focused QLoRA curriculum, exactly the same "cheap experiment
+before the expensive one" role the frozen-encoder linear probe (section 2 above) plays for the
+color-codec branch. Commit `typography_ocr_report.md` + `.json` verbatim, same convention as the
+probe reports in section 2.
+
 ## 4. QLoRA fine-tune (only if step 2 passed; tens of GPU-hours)
 
 **This section describes the DEFAULT curriculum (`--curriculum large_palette`, i.e.
