@@ -72,6 +72,52 @@ Decision rules (also printed per-cell by the script):
 Paste `probe_report.md` back into the repo (commit it) — it is the Phase-2 Step-0 artifact
 the README's roadmap points at.
 
+## 2.5 Localization follow-ups (run these — the 2026-07 session measured the merged probe at/near chance)
+
+**Status from the first GPU session (committed on `gpu-results`):** the merged-stage probe on
+the 3B tower came back at/near chance on every cell *including clean* (P=16: 73.6% error vs
+6.3% budget, with 23% error even on its own training set — genuine linear non-separability,
+not an underpowered probe; P=128/256: near-total, with heavy train/test overfit gaps). Weak
+above-chance signal exists everywhere (4–24× chance accuracy), so the token-order assumption
+holds; the signal is simply ~10–15× too weak. The measured text baseline also moved the bar
+up: ascii85 = 8.374 bits/token > base64's 8.096.
+
+Per the decision table above, that is a FAIL pending three cheap follow-ups (~$1–2 total).
+Run all three before deciding anything:
+
+```bash
+# (a) escalate the tower: does 7B preserve more?
+python scripts/run_probe.py --model-id Qwen/Qwen2.5-VL-7B-Instruct \
+    --palettes 16,256 --corruptions clean \
+    --n-train-images 6 --n-test-images 3 \
+    --out probe_report_7b.md --json probe_report_7b.json
+
+# (b) easy mode: if even BINARY color (chance=50%) is unreadable, the result is airtight
+python scripts/run_probe.py --model-id Qwen/Qwen2.5-VL-3B-Instruct \
+    --palettes 2,4 --corruptions clean \
+    --n-train-images 12 --n-test-images 4 \
+    --out probe_report_easy.md --json probe_report_easy.json
+
+# (c) LOCALIZATION: probe the merger's INPUT (per-patch states, 1 symbol per row).
+#     The merged-stage fail localizes the loss to at-or-before the merger OUTPUT;
+#     this run splits that ambiguity.
+python scripts/run_probe.py --model-id Qwen/Qwen2.5-VL-3B-Instruct \
+    --probe-stage pre_merger --palettes 16,256 --corruptions clean,jpeg_q70 \
+    --n-train-images 6 --n-test-images 3 \
+    --out probe_report_premerger.md --json probe_report_premerger.json
+```
+
+Decision rules for (c), the one that decides step 7:
+
+| pre_merger result (clean) | Meaning | Step 7 (QLoRA)? |
+|---|---|---|
+| at/below RS budget (~6.3%) | the vision blocks DO carry per-patch color; the **merger MLP** is what destroys it | **Justified, targeted**: the default LoRA config already tunes the merger (`visual.merger.mlp.0/.2`) — that layer now has a concrete, measured job. Consider raising `--lora-rank` since the merger is carrying the fix. |
+| well above budget but far below chance | partial signal reaches the merger input; the tower attenuates it progressively | Long shot. If you run step 7 anyway, use `--include-vision-blocks` and treat the first curriculum stage's held-out accuracy as a hard kill gate. |
+| at/near chance | the vision **blocks** already discarded flat-color identity — nothing downstream (merger, LM, LoRA on either) can recover it | **No. Stop.** Write up the negative result — a designed-for-the-channel code, a measured channel, and a tower that provably discards it before the LM boundary is a complete, publishable answer. |
+
+If (a) shows the 7B tower passing where 3B failed, prefer switching the whole Phase-2 target
+to 7B over any amount of 3B fine-tuning.
+
 ## 3. Optional: stock-model zero-shot floor (~30 min)
 
 Before fine-tuning, measure what the *unmodified* model does, so the fine-tune has a real

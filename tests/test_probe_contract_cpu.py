@@ -156,6 +156,176 @@ def test_cell_arrays_and_probe_end_to_end_at_chance(tiny_model, processor_shim):
     assert cell.fit.symbol_error > 0.01
 
 
+def _color_image(colors_by_patch, patch=14):
+    """Build an image from a 2D list of per-patch RGB colors (rows of patches)."""
+    import numpy as np
+    from PIL import Image
+
+    rows = len(colors_by_patch)
+    cols = len(colors_by_patch[0])
+    arr = np.zeros((rows * patch, cols * patch, 3), dtype=np.uint8)
+    for r in range(rows):
+        for c in range(cols):
+            arr[r * patch : (r + 1) * patch, c * patch : (c + 1) * patch] = colors_by_patch[r][c]
+    return Image.fromarray(arr)
+
+
+def test_pixel_values_row_order_is_unit_raster_then_within_unit_raster(processor_shim):
+    """THE ordering assumption pre-merger probing rests on, verified at the pixel level: the
+    processor's pixel_values rows are grouped 4-per-merge-unit, units in raster order over the
+    merged grid, TL/TR/BL/BR within each unit. Verified by decoding patch COLORS back out of
+    pixel_values: build reference signatures from single-color images (layout-agnostic), then
+    check an 8-distinct-color 4x2-patch image (2 merge units side by side) row by row."""
+    import numpy as np
+
+    ip = processor_shim.image_processor
+
+    def rows_of(img):
+        return ip(images=[img.convert("RGB")], return_tensors="pt")["pixel_values"].numpy()
+
+    colors = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+        (255, 0, 255), (0, 255, 255), (255, 255, 255), (30, 30, 30),
+    ]
+    # signature per color: one row from a 2x2-patch single-color image (all 4 rows identical)
+    signatures = {}
+    for color in colors:
+        r = rows_of(_color_image([[color, color], [color, color]]))
+        assert np.allclose(r, r[0])  # sanity: uniform image -> identical patch rows
+        signatures[color] = r[0]
+
+    # 4x2-patch image = two 2x2 merge units. Left unit: colors[0..3] as TL,TR,BL,BR;
+    # right unit: colors[4..7] likewise.
+    img = _color_image([
+        [colors[0], colors[1], colors[4], colors[5]],
+        [colors[2], colors[3], colors[6], colors[7]],
+    ])
+    rows = rows_of(img)
+    assert rows.shape[0] == 8
+    expected = [colors[0], colors[1], colors[2], colors[3],
+                colors[4], colors[5], colors[6], colors[7]]
+    for i, exp_color in enumerate(expected):
+        dists = {c: float(np.abs(rows[i] - sig).mean()) for c, sig in signatures.items()}
+        nearest = min(dists, key=dists.get)
+        assert nearest == exp_color, (
+            f"pixel_values row {i} decodes to color {nearest}, expected {exp_color} -- the "
+            "unit-raster/TL-TR-BL-BR ordering assumption does not hold for this processor"
+        )
+
+
+def test_pre_merger_unshuffle_reproduces_pooler_output_exactly(tiny_model, processor_shim):
+    """End-to-end permutation correctness: re-running the tower's OWN merger over the
+    unshuffled pre-merger states must reproduce pooler_output (raster order) -- if the
+    recovered permutation were wrong anywhere, rows would disagree."""
+    rp = _load_run_probe()
+    from heliogram.dataset import generate_examples
+
+    ex = next(generate_examples(1, palettes=[16], subpatches=[1], payload_sizes=[64], seed=0))
+    out = processor_shim.image_processor(images=[ex.image.convert("RGB")], return_tensors="pt")
+    w, h = ex.image.width // 14, ex.image.height // 14
+    n_units = (h // 2) * (w // 2)
+    visual = tiny_model.model.visual
+
+    unshuffled, pooled, reverse = rp._extract_pre_merger_embeddings(
+        visual, out["pixel_values"].float(), out["image_grid_thw"], n_units
+    )
+    assert unshuffled.shape == (n_units * 4, 32)  # vision hidden_size
+    assert sorted(reverse.tolist()) == list(range(n_units))
+    with torch.no_grad():
+        remerged = visual.merger(unshuffled)
+    torch.testing.assert_close(remerged, pooled, rtol=0, atol=0)
+
+
+def test_match_reverse_indices_recovers_permutation_and_fails_loud():
+    rp = _load_run_probe()
+    g = torch.Generator().manual_seed(0)
+    merger_out = torch.randn(10, 6, generator=g)
+    perm = torch.randperm(10, generator=g)
+    pooled = merger_out[perm]
+    recovered = rp._match_reverse_indices(pooled, merger_out)
+    assert torch.equal(recovered, perm)
+
+    # duplicate rows -> refuse rather than guess
+    dup = merger_out.clone()
+    dup[3] = dup[7]
+    with pytest.raises(RuntimeError, match="byte-identical"):
+        rp._match_reverse_indices(dup[perm], dup)
+
+    # unmatched rows -> refuse
+    with pytest.raises(RuntimeError, match="no byte-identical row"):
+        rp._match_reverse_indices(pooled + 1.0, merger_out)
+
+
+def test_pre_merger_cell_arrays_align_labels_and_probe_runs(tiny_model, processor_shim):
+    """The full pre-merger cell path: per-patch embeddings, per-patch labels (calibration row
+    masked), probe fit + verdict -- the rehearsal for the localization run."""
+    rp = _load_run_probe()
+
+    X_tr, y_tr = rp._cell_arrays(
+        tiny_model, processor_shim, torch.float32, "cpu",
+        palette=16, corruption_name="clean", corruption_fn=lambda im: im,
+        n_images=2, payload_size=48, seed_base=1_000, stage="pre_merger",
+    )
+    X_te, y_te = rp._cell_arrays(
+        tiny_model, processor_shim, torch.float32, "cpu",
+        palette=16, corruption_name="clean", corruption_fn=lambda im: im,
+        n_images=1, payload_size=48, seed_base=2_000_000, stage="pre_merger",
+    )
+    assert y_tr.shape[1] == 1  # one symbol per patch row
+    assert X_tr.shape[1] == 32  # vision hidden, not out_hidden (24)
+    # 4x the sample count of the merged stage for the same images
+    X_tr_m, _ = rp._cell_arrays(
+        tiny_model, processor_shim, torch.float32, "cpu",
+        palette=16, corruption_name="clean", corruption_fn=lambda im: im,
+        n_images=2, payload_size=48, seed_base=1_000, stage="merged",
+    )
+    assert X_tr.shape[0] == 4 * X_tr_m.shape[0]
+    # calibration-row patches masked, data patches labeled in range
+    assert (y_tr == -1).sum() > 0
+    assert y_tr.max() < 16
+
+    cell = evaluate_cell(16, "clean", X_tr, y_tr, X_te, y_te, epochs=5)
+    assert 0.0 <= cell.fit.symbol_error <= 1.0 and cell.verdict
+
+
+def test_pre_merger_labels_match_patch_colors_through_pixel_values(processor_shim):
+    """Label/row alignment sanity at full strength: for a real heliogram image, the color
+    decoded from pixel_values row i must be the palette color of the symbol that
+    merged_token_labels.reshape(-1) says lives at row i (calibration rows excluded). This ties
+    the LABELS (probe ground truth) to the PIXELS (what the tower actually ingests) with no
+    model in between -- if this holds and the unshuffle/merger test above holds, the
+    pre-merger probe's features and labels are aligned end to end."""
+    import numpy as np
+    from heliogram.codec import get_palette
+    from heliogram.dataset import generate_examples, target_to_symbols
+
+    ex = next(generate_examples(1, palettes=[16], subpatches=[1], payload_sizes=[48], seed=5))
+    img = ex.image
+    w, h = img.width // PATCH_SIZE, img.height // PATCH_SIZE
+    symbols = target_to_symbols(ex.target, 16)
+    labels = merged_token_labels(w, h, symbols, merge=2).reshape(-1)
+
+    ip = processor_shim.image_processor
+    rows = ip(images=[img.convert("RGB")], return_tensors="pt")["pixel_values"].numpy()
+    assert rows.shape[0] == labels.shape[0]
+
+    palette_colors = get_palette(16)
+    signatures = {}
+    for idx, color in enumerate(palette_colors):
+        r = ip(images=[_color_image([[color, color], [color, color]]).convert("RGB")],
+               return_tensors="pt")["pixel_values"].numpy()
+        signatures[idx] = r[0]
+
+    checked = 0
+    for i, lab in enumerate(labels.tolist()):
+        if lab < 0:
+            continue  # calibration-row patch
+        dists = {s: float(np.abs(rows[i] - sig).mean()) for s, sig in signatures.items()}
+        assert min(dists, key=dists.get) == lab, f"row {i}: pixel color != label {lab}"
+        checked += 1
+    assert checked > 100  # the assertion actually ran over real data patches
+
+
 def test_merged_token_labels_alignment_against_processor_grid(processor_shim):
     """grid_thw's (h, w) convention vs merged_token_labels' (width, height) convention is an
     easy silent-transpose trap; pin that the two agree on the merged-token COUNT for a

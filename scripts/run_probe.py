@@ -12,6 +12,23 @@ Usage (on a GPU box with `pip install -e . -r requirements-gpu.txt` done):
         --corruptions clean,jpeg_q70 --n-train-images 6 --n-test-images 3 \\
         --out probe_report.md --json probe_report.json
 
+TWO PROBE STAGES (--probe-stage):
+  merged (default)  POST-merger embeddings, 4 symbols per LM-visible token -- the LM-token
+                    branch's go/no-go. A fail here (measured 2026-07: at/near chance on the 3B
+                    tower, every palette, clean included) localizes the loss to AT OR BEFORE
+                    the merger output, but not which side.
+  pre_merger        per-PATCH states at the merger's INPUT (post vision blocks), one symbol
+                    per row -- the LOCALIZATION run that splits the ambiguity: readable here
+                    but not at `merged` means the merger MLP destroys the symbols, and
+                    scripts/train_qlora.py's default merger-LoRA has a concrete, targeted job;
+                    unreadable even here means the vision BLOCKS already discarded flat-color
+                    identity and no merger/LM tuning can recover it -- stop.
+                    Window-order unshuffling is recovered from the tower's own outputs by
+                    exact row-matching (no private transformers imports); every ordering link
+                    is CPU-verified in tests/test_probe_contract_cpu.py, including that
+                    re-running the tower's merger on the unshuffled states reproduces
+                    pooler_output exactly.
+
 DATA HONESTY (mirrors heliogram/vlm.py's module docstring): this file has never been run
 against real WEIGHTS in this repository -- there is no GPU and no HF Hub access here. But the
 model-INTERFACE contract it relies on (visual-tower attribute path, image-processor call and
@@ -68,6 +85,14 @@ def _parse_args(argv=None):
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    ap.add_argument("--probe-stage", default="merged", choices=["merged", "pre_merger"],
+                    help="merged (default): probe POST-merger embeddings, 4 symbols per LM "
+                    "token -- the LM-token-branch go/no-go. pre_merger: probe the per-patch "
+                    "states at the merger's INPUT (1 symbol per row) -- the LOCALIZATION run: "
+                    "readable here but not at 'merged' means the merger MLP destroys the "
+                    "symbols (and merger-LoRA has a concrete target); unreadable even here "
+                    "means the vision blocks already discarded them and no merger/LM tuning "
+                    "can recover it.")
     ap.add_argument("--out", default="probe_report.md")
     ap.add_argument("--json", dest="json_out", default=None)
     return ap.parse_args(argv)
@@ -134,7 +159,103 @@ def _merged_embeddings_tensor(visual_out, expected_tokens: int):
     return emb
 
 
-def _load_tower(model_id: str, device: str, dtype_name: str):
+def _match_reverse_indices(pooled, merger_out):
+    """Recover the window-unshuffle permutation WITHOUT importing transformers' private index
+    helpers: the 5.x vision tower computes `pooler_output = merger_out[reverse_indices]` (its
+    merger runs in window-shuffled order, then rows are restored to raster order), so matching
+    each pooled row to its byte-identical row in the raw merger output recovers
+    `reverse_indices` exactly. Version-robust (any tower where the returned merged rows are a
+    permutation of the merger's raw output rows -- including the identity permutation -- works)
+    and fail-loud: raises on any duplicate, unmatched, or non-permutation row rather than
+    returning a plausible-but-wrong ordering. Duplicate merged rows are effectively impossible
+    for real inputs (rotary position embeddings make every token position-distinct), so hitting
+    the duplicate guard means something is deeply wrong -- do not trust that run."""
+    import torch
+
+    if pooled.shape != merger_out.shape:
+        raise RuntimeError(
+            f"pooled/merger-output shape mismatch: {tuple(pooled.shape)} vs "
+            f"{tuple(merger_out.shape)} -- the merger hook captured something unexpected"
+        )
+    out_np = merger_out.detach().float().cpu().numpy()
+    pooled_np = pooled.detach().float().cpu().numpy()
+    lookup = {}
+    for j in range(out_np.shape[0]):
+        key = out_np[j].tobytes()
+        if key in lookup:
+            raise RuntimeError(
+                f"merger output rows {lookup[key]} and {j} are byte-identical -- cannot "
+                "recover the unshuffle permutation unambiguously; do not trust this run"
+            )
+        lookup[key] = j
+    reverse = []
+    for i in range(pooled_np.shape[0]):
+        j = lookup.get(pooled_np[i].tobytes())
+        if j is None:
+            raise RuntimeError(
+                f"pooled row {i} has no byte-identical row in the raw merger output -- the "
+                "pooled-rows-are-a-permutation-of-merger-rows contract does not hold for this "
+                "transformers version; do not trust this run"
+            )
+        reverse.append(j)
+    if len(set(reverse)) != len(reverse):
+        raise RuntimeError("recovered index list is not a permutation; do not trust this run")
+    return torch.tensor(reverse, dtype=torch.long, device=merger_out.device)
+
+
+def _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units: int):
+    """Per-PATCH hidden states at the merger's INPUT (post vision blocks, pre 2x2 merge),
+    restored to raster order: row `m * 4 + p` is merge-unit m (raster over the merged grid),
+    within-unit position p (row-major within the 2x2 block: TL, TR, BL, BR) -- exactly the
+    label layout heliogram.probe.merged_token_labels uses, so `labels.reshape(-1, 1)` aligns
+    1:1 with these rows.
+
+    WHY THE ORDERING HOLDS (each piece CPU-verified in tests/test_probe_contract_cpu.py):
+      - the processor's `pixel_values` rows are already grouped 4-consecutive-per-merge-unit,
+        units in raster order, TL/TR/BL/BR within each unit (verified directly by decoding the
+        patch COLORS back out of pixel_values for a known image);
+      - the tower's blocks preserve row order except one shuffle at merge-unit granularity
+        (`window_index`), applied before the blocks and undone (post-merger) via
+        `reverse_indices` -- recovered here by `_match_reverse_indices`, no private imports;
+      - re-running the tower's own merger on the unshuffled states returned here reproduces
+        `pooler_output` byte-for-byte (the end-to-end assertion in the test file).
+    """
+    import torch
+
+    captured = {}
+
+    def _pre_hook(module, args):
+        captured["in"] = args[0]
+
+    def _post_hook(module, args, output):
+        captured["out"] = output
+
+    h1 = visual.merger.register_forward_pre_hook(_pre_hook)
+    h2 = visual.merger.register_forward_hook(_post_hook)
+    try:
+        with torch.no_grad():
+            visual_out = visual(pixel_values, grid_thw=grid_thw)
+    finally:
+        h1.remove()
+        h2.remove()
+    if "in" not in captured or "out" not in captured:
+        raise RuntimeError(
+            "the merger hooks never fired -- this tower's merger module path differs from "
+            "visual.merger; do not trust this run"
+        )
+
+    pooled = _merged_embeddings_tensor(visual_out, n_units)
+    reverse = _match_reverse_indices(pooled, captured["out"])
+
+    merger_in = captured["in"]
+    seq_len, hidden = merger_in.shape
+    if seq_len != n_units * 4:
+        raise RuntimeError(
+            f"merger input has {seq_len} rows, expected {n_units * 4} (4 patches per merged "
+            "token) -- token-count contract violated; do not trust this run"
+        )
+    units = merger_in.reshape(n_units, 4, hidden)
+    return units[reverse].reshape(seq_len, hidden), pooled, reverse
     """Load the full model once, keep only what the probe needs (the visual tower + processor).
     The load call itself is untested against real WEIGHTS in this repo (no HF Hub access/GPU
     here), but the attribute layout, call signature, and output contract it relies on are
@@ -161,9 +282,18 @@ def _load_tower(model_id: str, device: str, dtype_name: str):
     return model, processor, dtype
 
 
-def _extract_embeddings(model, processor, dtype, device: str, img) -> np.ndarray:
-    """One image -> (n_merged_tokens, hidden) float32 numpy. Asserts identity preprocessing:
-    the processor's reported patch grid must equal the image's own 14px grid exactly."""
+def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = "merged") -> np.ndarray:
+    """One image -> float32 numpy embeddings for the requested probe stage. Asserts identity
+    preprocessing: the processor's reported patch grid must equal the image's own 14px grid.
+
+    stage="merged" (default): (n_merged_tokens, out_hidden) POST-merger embeddings, raster
+    order -- what the LM actually sees; one row per 2x2 merge unit, 4 symbols per row.
+    stage="pre_merger": (n_patches, vision_hidden) PRE-merger per-patch states, raster order
+    (see _extract_pre_merger_embeddings) -- one row per patch, ONE symbol per row. This is the
+    LOCALIZATION stage: if symbols are linearly readable here but not at "merged", the merger
+    MLP (which scripts/train_qlora.py LoRA-tunes by default) is what destroys them and a
+    targeted fine-tune has a concrete target; if they are unreadable even here, the vision
+    blocks themselves discarded the information and no merger/LM tuning can recover it."""
     import torch
 
     out = processor.image_processor(images=[img.convert("RGB")], return_tensors="pt")
@@ -178,20 +308,31 @@ def _extract_embeddings(model, processor, dtype, device: str, img) -> np.ndarray
             "note) instead of measuring a corrupted channel."
         )
     visual = _resolve_visual_tower(model)
+    n_units = (exp_h // MERGE) * (exp_w // MERGE)
+    pixel_values = out["pixel_values"].to(device=device, dtype=dtype)
+    grid_thw = grid_thw.to(device)
+
+    if stage == "pre_merger":
+        emb, _, _ = _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units)
+        return emb.float().cpu().numpy()
+    if stage != "merged":
+        raise ValueError(f"unknown probe stage {stage!r}; use 'merged' or 'pre_merger'")
     with torch.no_grad():
-        visual_out = visual(
-            out["pixel_values"].to(device=device, dtype=dtype),
-            grid_thw=grid_thw.to(device),
-        )
-    emb = _merged_embeddings_tensor(visual_out, (exp_h // MERGE) * (exp_w // MERGE))
+        visual_out = visual(pixel_values, grid_thw=grid_thw)
+    emb = _merged_embeddings_tensor(visual_out, n_units)
     return emb.float().cpu().numpy()
 
 
 def _cell_arrays(model, processor, dtype, device, palette, corruption_name, corruption_fn,
-                 n_images, payload_size, seed_base):
+                 n_images, payload_size, seed_base, stage="merged"):
     """Generate n_images examples for one (palette, corruption) and return stacked
     (embeddings, labels). Labels come from the CLEAN image (dataset contract); embeddings from
-    the corrupted one -- exactly the read-through-corruption task."""
+    the corrupted one -- exactly the read-through-corruption task.
+
+    stage="merged": one row per merged token, labels shape (n, 4) -- 4 symbols per token.
+    stage="pre_merger": one row per PATCH, labels shape (n, 1) -- merged_token_labels
+    row-major-flattened, which aligns 1:1 with _extract_pre_merger_embeddings' row order
+    (unit-raster, then TL/TR/BL/BR within the unit; see that function's docstring)."""
     xs, ys = [], []
     examples = generate_examples(
         n_images,
@@ -208,7 +349,9 @@ def _cell_arrays(model, processor, dtype, device, palette, corruption_name, corr
         w, h = ex.image.width // PATCH_SIZE, ex.image.height // PATCH_SIZE
         symbols = target_to_symbols(ex.target, palette)
         labels = merged_token_labels(w, h, symbols, merge=MERGE)
-        emb = _extract_embeddings(model, processor, dtype, device, ex.image)
+        if stage == "pre_merger":
+            labels = labels.reshape(-1, 1)
+        emb = _extract_embeddings(model, processor, dtype, device, ex.image, stage=stage)
         if emb.shape[0] != labels.shape[0]:
             raise RuntimeError(
                 f"embedding/label count mismatch: {emb.shape[0]} vs {labels.shape[0]}"
@@ -233,14 +376,15 @@ def main(argv=None) -> int:
     for palette in palettes:
         for cname in corruption_names:
             cfn = CORRUPTIONS[cname]
-            print(f"[palette={palette} corruption={cname}] extracting embeddings ...", flush=True)
+            print(f"[palette={palette} corruption={cname} stage={args.probe_stage}] "
+                  "extracting embeddings ...", flush=True)
             # Disjoint seed ranges -> disjoint payloads between train and test.
             X_tr, y_tr = _cell_arrays(model, processor, dtype, args.device, palette, cname, cfn,
                                       args.n_train_images, args.payload_size,
-                                      seed_base=args.seed + 1_000)
+                                      seed_base=args.seed + 1_000, stage=args.probe_stage)
             X_te, y_te = _cell_arrays(model, processor, dtype, args.device, palette, cname, cfn,
                                       args.n_test_images, args.payload_size,
-                                      seed_base=args.seed + 2_000_000)
+                                      seed_base=args.seed + 2_000_000, stage=args.probe_stage)
             cell = evaluate_cell(palette, cname, X_tr, y_tr, X_te, y_te,
                                  seed=args.seed, epochs=args.epochs)
             print(f"  symbol_error={cell.fit.symbol_error:.4f} "
@@ -248,7 +392,7 @@ def main(argv=None) -> int:
                   f"chance {cell.chance_error:.4f}) -> {cell.verdict}", flush=True)
             cells.append(cell)
 
-    report = format_report(cells, model_id=args.model_id)
+    report = format_report(cells, model_id=f"{args.model_id} [probe-stage={args.probe_stage}]")
     Path(args.out).write_text(report)
     print(f"\nwrote {args.out}")
     if args.json_out:
