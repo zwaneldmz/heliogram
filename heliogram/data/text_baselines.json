@@ -1,0 +1,41 @@
+{
+  "encodings": {
+    "ascii85": {
+      "bits_per_token": 8.373831775700934,
+      "chars_per_token": 1.308411214953271,
+      "encoding": "ascii85",
+      "tokens_per_kb": 978.2857142857143
+    },
+    "base64": {
+      "bits_per_token": 8.096385542168674,
+      "chars_per_token": 1.3497740963855422,
+      "encoding": "base64",
+      "tokens_per_kb": 1011.8095238095239
+    },
+    "base85": {
+      "bits_per_token": 8.178369384359401,
+      "chars_per_token": 1.2778702163061564,
+      "encoding": "base85",
+      "tokens_per_kb": 1001.6666666666666
+    },
+    "hex": {
+      "bits_per_token": 4.5335207308503165,
+      "chars_per_token": 1.1333801827125791,
+      "encoding": "hex",
+      "tokens_per_kb": 1806.984126984127
+    }
+  },
+  "measured_note": "measured: Qwen/Qwen2.5-VL-7B-Instruct tokenizer (transformers==5.13.0), 3 sizes x 3 seeds per encoding. bits/token ranking: ascii85=8.374, base85=8.178, base64=8.096, hex=4.534. STRONGEST: ascii85 at 8.3738 bits/token -- this, not base64 specifically, is the honest text-context economic bar for this tokenizer.",
+  "sample_sizes": [
+    1024,
+    4096,
+    16384
+  ],
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "tokenizer_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "tokenizer_package": "transformers==5.13.0"
+}
