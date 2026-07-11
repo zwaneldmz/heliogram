@@ -20,6 +20,7 @@ from heliogram.probe import (
     ProbeCellReport,
     evaluate_cell,
     fit_linear_probe,
+    fit_mlp_probe,
     format_report,
     merged_token_labels,
     rs_symbol_error_budget,
@@ -273,13 +274,14 @@ def test_probe_head_default_is_linear():
     assert args.probe_head == "linear"
 
 
-def test_probe_head_mlp_raises_before_any_model_or_torch_work():
-    """--probe-head mlp is a designed refusing stub (Task 1, empirical): main() must raise
-    NotImplementedError itself, before _load_tower and before any torch/transformers import --
-    this test runs with no torch installed, so any attempt to import it would fail the test for
-    the wrong reason if the guard didn't fire first."""
+def test_probe_head_mlp_is_implemented_not_a_refusing_stub():
+    """--probe-head mlp is now IMPLEMENTED (heliogram.probe.fit_mlp_probe), not a stub: main()
+    must NOT raise NotImplementedError for it -- it should proceed past the CLI guards to the
+    model-load stage (which, with no torch installed here, then fails at run_probe._load_tower's
+    `import torch`). We assert it gets that far, i.e. the nonlinear path is real, not refused."""
     rp = _load_run_probe()
-    with pytest.raises(NotImplementedError, match="probe-head mlp"):
+    assert rp._parse_args(["--probe-head", "mlp"]).probe_head == "mlp"
+    with pytest.raises(ModuleNotFoundError):  # reaches _load_tower -> import torch (absent here)
         rp.main(["--probe-head", "mlp", "--palettes", "16", "--corruptions", "clean"])
 
 
@@ -302,6 +304,58 @@ def test_default_model_arch_is_the_verified_qwen_entry():
     # earns its own CPU contract test -- guard the invariant, not just today's single entry.
     unverified = [name for name, e in rp.TOWER_REGISTRY.items() if not e.get("verified")]
     assert rp.DEFAULT_ARCH not in unverified
+
+
+def _xor_dataset(seed=0, n=4000, dim=8):
+    """A deliberately NON-linearly-separable 2-class problem: label = sign(x0) XOR sign(x1), the
+    other dims noise. A linear probe cannot beat chance on it; an MLP can -- the exact capability
+    gap --probe-head mlp exists to detect."""
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((n, dim))
+    lab = ((X[:, 0] > 0) ^ (X[:, 1] > 0)).astype(int)
+    y = lab.reshape(-1, 1)
+    cut = (n * 3) // 4
+    return X[:cut], y[:cut], X[cut:], y[cut:]
+
+
+def test_fit_mlp_probe_solves_a_nonlinear_task_the_linear_probe_cannot():
+    Xtr, ytr, Xte, yte = _xor_dataset(seed=0)
+    lin = fit_linear_probe(Xtr, ytr, Xte, yte, n_classes=2, seed=0, epochs=60)
+    mlp = fit_mlp_probe(Xtr, ytr, Xte, yte, n_classes=2, seed=0, epochs=60)
+    # linear is stuck near chance (0.5); the MLP drives error far below it -- the capability gap.
+    assert lin.symbol_error > 0.4
+    assert mlp.symbol_error < 0.15
+    assert mlp.symbol_error < lin.symbol_error - 0.2
+
+
+def test_fit_mlp_probe_is_deterministic_for_fixed_seed():
+    Xtr, ytr, Xte, yte = _xor_dataset(seed=1)
+    a = fit_mlp_probe(Xtr, ytr, Xte, yte, n_classes=2, seed=3, epochs=20)
+    b = fit_mlp_probe(Xtr, ytr, Xte, yte, n_classes=2, seed=3, epochs=20)
+    assert a.symbol_error == b.symbol_error
+    assert a.train_symbol_error == b.train_symbol_error
+
+
+def test_fit_mlp_probe_ignores_negative_labels_and_validates_shapes():
+    Xtr, ytr, Xte, yte = _xor_dataset(seed=2)
+    ytr_masked = ytr.copy()
+    ytr_masked[:100] = -1  # excluded positions must not break the fit or the position accounting
+    res = fit_mlp_probe(Xtr, ytr_masked, Xte, yte, n_classes=2, seed=0, epochs=10)
+    assert res.n_train_positions == int((ytr_masked >= 0).sum())
+    with pytest.raises(ValueError):
+        fit_mlp_probe(Xtr, -np.ones_like(ytr), Xte, yte, n_classes=2)  # no valid labels
+
+
+def test_evaluate_cell_mlp_head_scopes_verdict_to_nonlinear():
+    Xtr, ytr, Xte, yte = _xor_dataset(seed=0)
+    cell = evaluate_cell(2, "clean", Xtr, ytr, Xte, yte, seed=0, epochs=60, head="mlp")
+    assert cell.head == "mlp"
+    # the MLP solves it, so it lands below the RS budget -> "readable by a trained MLP" wording,
+    # never the linear phrasing.
+    assert "MLP" in cell.verdict
+    assert "LINEARLY-DECODABLE" not in cell.verdict
+    with pytest.raises(ValueError, match="unknown probe head"):
+        evaluate_cell(2, "clean", Xtr, ytr, Xte, yte, head="quadratic")
 
 
 def test_resolve_visual_tower_walks_dotted_attr_paths():

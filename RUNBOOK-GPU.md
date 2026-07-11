@@ -396,23 +396,35 @@ destroyed post-merger (`probe_report.md`/`probe_report_7b.md`: 65.5–73.6%). **
 run against real weights anywhere in this repo — there is no GPU here.** It is a designed,
 CPU-contract-tested (`tests/test_merger_adapter_contract_cpu.py`), REFUSING scaffold: its CLI
 entry point never loads a model itself and always raises before touching torch (see the
-script's own module docstring, "REAL INVOCATION"). To actually run either design, drive it from
-a GPU-side Python driver that has already loaded a real tower:
+script's own module docstring, "REAL INVOCATION").
+
+**Easiest path — the shipped driver + one-shot script** (no snippet to hand-write):
+
+```bash
+# One-shot: alignment gate + post-merger probe + Design A, in order, with the decision rule
+# printed at the end. GPU required.
+bash scripts/gpu_gonogo.sh Qwen/Qwen2.5-VL-3B-Instruct
+
+# Or drive a single design directly (scripts/drive_merger_adapter.py loads the tower via
+# run_probe._load_tower, enforces the budget cap, then calls run_design_a/b with the real model):
+python scripts/drive_merger_adapter.py --design a --palette 16 --corruptions clean,jpeg_q70 --out design_a.json
+python scripts/drive_merger_adapter.py --design b --lora-variant B1 --palette 16 \
+    --corruptions clean,jpeg_q70 --epochs 20 --lora-rank 8 --out design_b.json
+```
+
+Under the hood the driver is exactly the scaffold's own "REAL INVOCATION" recipe:
 
 ```python
 from scripts.run_probe import _load_tower       # the exact loader run_probe.py's main() uses
 model, processor, dtype = _load_tower("Qwen/Qwen2.5-VL-3B-Instruct", "cuda", "bfloat16")
-
 import scripts.train_merger_adapter as tma
-
-# Design A first: cheap, no-backprop diagnostic -- does a NONLINEAR readout on the SAME frozen
-# pre-merger embeddings the linear probe already used recover more signal than Step 0 measured?
-report_a = tma.run_design_a(model, processor, dtype=dtype, device="cuda")
-
-# Design B: the actual gate -- LoRA-tunes (or B2 parallel-adapts) ONLY the merger MLP, jointly
-# with a trained readout head, gradients flowing into the merger's own parameters.
-report_b = tma.run_design_b(model, processor, dtype=dtype, device="cuda", variant="B1")
+report_a = tma.run_design_a(model, processor, dtype=dtype, device="cuda")            # cheap first
+report_b = tma.run_design_b(model, processor, dtype=dtype, device="cuda", variant="B1")  # the gate
 ```
+
+(Related: the frozen-embedding nonlinear question Design A answers at the merger *input* can also
+be asked at any probe tap directly with `scripts/run_probe.py --probe-head mlp`, now implemented —
+`heliogram.probe.fit_mlp_probe`, a one-hidden-layer readout — though it, too, needs a real tower.)
 
 **Alignment sanity assert — run this first, every time.** Both `run_design_a` and
 `run_design_b` re-run the exact (palette=16, clean, pre_merger) probe cell

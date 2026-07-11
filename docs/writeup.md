@@ -19,7 +19,7 @@ error-correction-adjusted ceiling, 6.996 bits/patch, sits below the measured tex
 (ascii85, 8.374 bits/token); frozen-tower linear probes on real Qwen2.5-VL weights (3B, 7B) show
 the model's patch-merger step leaves no linearly-decodable trace of the fine symbolic structure
 the codec needs, even where the vision blocks upstream partially preserve it linearly (a
-nonlinear probe was not tested and could differ — Section 7). A typography pivot — rendering the
+a nonlinear probe — now available as `--probe-head mlp`, not yet run on real weights — could differ; Section 7). A typography pivot — rendering the
 payload as dense typeset ascii85 text, the kind of input VLM towers demonstrably do read (DeepSeek-OCR,
 Glyph) — passes its geometric gate but fails a zero-shot OCR readability measurement: font sizes
 the tower reads accurately sit roughly 4x below the economic bar in density, and sizes dense

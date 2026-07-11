@@ -294,7 +294,11 @@ a future model — not a demonstrated exploit.
   training data, could recover more than a linear readout does at the same
   tap point (probe report headers: "a PASS here means the frozen embeddings
   linearly carry the symbols — it de-risks, but does not replace, the
-  fine-tune").
+  fine-tune"). That nonlinear readout is now implemented and unit-tested —
+  `scripts/run_probe.py --probe-head mlp` (a one-hidden-layer MLP head,
+  `heliogram.probe.fit_mlp_probe`) — but has **not** been run against real
+  weights here (no GPU); a probe, linear or not, is still not the LM using
+  the symbols.
 - A **fine-tuned** adversary — one that trains the vision tower or merger
   itself to preserve this structure, rather than reading frozen embeddings —
   is a different, unmeasured question; the probes only characterize what the

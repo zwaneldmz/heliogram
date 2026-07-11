@@ -24,23 +24,25 @@ TWO PROBE STAGES (--probe-stage):
                     unreadable even here means the vision BLOCKS already discarded flat-color
                     identity such that no LINEARLY-DECODABLE per-patch signal survives even at
                     this earlier tap point -- a higher-capacity/nonlinear probe could still
-                    differ (untested; see docs/FINDINGS.md Section 5 and --probe-head mlp, a
-                    designed refusing stub) -- treat as strong evidence to stop, not proof.
+                    differ (see docs/FINDINGS.md Section 5 and --probe-head mlp, which runs
+                    exactly that nonlinear readout) -- treat as strong evidence to stop, not proof.
                     Window-order unshuffling is recovered from the tower's own outputs by
                     exact row-matching (no private transformers imports); every ordering link
                     is CPU-verified in tests/test_probe_contract_cpu.py, including that
                     re-running the tower's merger on the unshuffled states reproduces
                     pooler_output exactly.
 
-STUBS THAT REFUSE RATHER THAN FABRICATE (both fire in main(), before any model/torch import):
-  --probe-head {linear,mlp}   linear (default) is the measured, current behavior. mlp is the
-                              TODO(GPU) nonlinear-probe experiment (Task 1, empirical) -- NOT
-                              implemented; raises a NotImplementedError explaining why (see
-                              docs/FINDINGS.md Section 5).
+PROBE HEAD AND ARCH SELECTION:
+  --probe-head {linear,mlp}   linear (default) is the committed LINEAR softmax probe. mlp is the
+                              nonlinear-readout experiment (Task 1, empirical): one hidden ReLU
+                              layer (heliogram.probe.fit_mlp_probe) on the SAME frozen embeddings,
+                              to see whether a higher-capacity probe reads more than the linear
+                              one. A probe is still not the LM (see docs/FINDINGS.md Section 5).
   --model-arch ARCH           selects a TOWER_REGISTRY entry (Task 3, GPU stub); defaults to
                               "qwen2_5_vl", the only VERIFIED entry. Any other/unknown value
                               raises rather than silently reusing Qwen2.5-VL's interface
-                              contract for an unverified tower family.
+                              contract for an unverified tower family (this guard DOES still refuse
+                              -- an unregistered arch is not run).
 
 DATA HONESTY (mirrors heliogram/vlm.py's module docstring): this file has never been run
 against real WEIGHTS in this repository -- there is no GPU and no HF Hub access here. But the
@@ -150,10 +152,13 @@ def _parse_args(argv=None):
                     "_resolve_tower_arch above. Not restricted to argparse `choices` so the "
                     "guard's own message (not argparse's generic one) is what fires.")
     ap.add_argument("--probe-head", default="linear", choices=["linear", "mlp"],
-                    help="linear (default): the measured, committed probe (heliogram.probe."
-                    "fit_linear_probe) -- current behavior, unchanged. mlp: TODO(GPU) nonlinear-"
-                    "probe experiment (Task 1, empirical) -- NOT implemented; raises before any "
-                    "model/torch work rather than fabricating a result.")
+                    help="linear (default): the committed LINEAR softmax probe (heliogram.probe."
+                    "fit_linear_probe). mlp: the nonlinear-readout experiment (Task 1, empirical) "
+                    "-- one hidden ReLU layer (heliogram.probe.fit_mlp_probe), tests whether a "
+                    "higher-capacity probe reads more of the SAME frozen embeddings than the "
+                    "linear probe; a probe is still not the LM (see docs/FINDINGS.md Section 5).")
+    ap.add_argument("--mlp-hidden-dim", type=int, default=256,
+                    help="hidden width of the --probe-head mlp readout (ignored for linear)")
     ap.add_argument("--palettes", default="16,128,256",
                     help="comma-separated; default runs the README's Phase-2 order")
     ap.add_argument("--corruptions", default="clean,jpeg_q85,jpeg_q70",
@@ -405,8 +410,8 @@ def _extract_embeddings(model, processor, dtype, device: str, img, stage: str = 
     targeted fine-tune has a concrete target; if they are unreadable even here, the vision
     blocks themselves discarded the information: no LINEARLY-DECODABLE per-patch signal
     survives even at this earlier tap point (a higher-capacity/nonlinear probe run at the same
-    tap point could still differ -- untested here; see docs/FINDINGS.md Section 5 and
-    --probe-head mlp, a designed refusing stub)."""
+    tap point could still differ; see docs/FINDINGS.md Section 5 and --probe-head mlp, which
+    runs that nonlinear readout)."""
     import torch
 
     out = processor.image_processor(images=[img.convert("RGB")], return_tensors="pt")
@@ -479,22 +484,10 @@ def _cell_arrays(model, processor, dtype, device, palette, corruption_name, corr
 def main(argv=None) -> int:
     args = _parse_args(argv)
 
-    # --- guards: both fire here, before _load_tower, before torch/transformers ever import ---
-    if args.probe_head == "mlp":
-        raise NotImplementedError(
-            "--probe-head mlp is the TODO(GPU) nonlinear-probe experiment (Task 1, empirical) "
-            "-- NOT implemented. The probe this repo ships and has measured "
-            "(heliogram.probe.fit_linear_probe) is a plain-numpy LINEAR softmax readout; it "
-            "measures LINEAR readability of the frozen tower's embeddings only. A "
-            "higher-capacity, NONLINEAR probe (an MLP head) run at the SAME tap point could "
-            "still recover more signal than a linear readout does, without changing which "
-            "conclusion is warranted at the linear-probe level (see docs/FINDINGS.md Section 5, "
-            "'Honest limitations': the linear probe is a documented capacity bound, not a "
-            "ceiling). Running that experiment needs a GPU and real Qwen2.5-VL weights, neither "
-            "of which is present in this environment -- this is a designed, refusing stub: it "
-            "raises before touching any model rather than fabricating an MLP result. Use "
-            "--probe-head linear (the default) for the measured result."
-        )
+    # --probe-head {linear,mlp} both dispatch to heliogram.probe.evaluate_cell below. 'mlp' (the
+    # nonlinear-readout experiment, Task 1 empirical) is now implemented (heliogram.probe.
+    # fit_mlp_probe); it still needs a real tower to read embeddings from, so it runs on GPU just
+    # like the linear probe, and its verdict wording is scoped to the nonlinear claim.
     # Raises early (pure Python) on unknown/unverified arch; the entry is the single source of
     # truth for the tower's visual-attr paths and merge factor, threaded through below rather
     # than reading the module MERGE / hardcoded attr defaults downstream.
@@ -528,7 +521,8 @@ def main(argv=None) -> int:
                                       seed_base=args.seed + 2_000_000, stage=args.probe_stage,
                                       visual_attrs=visual_attrs, merge=merge)
             cell = evaluate_cell(palette, cname, X_tr, y_tr, X_te, y_te,
-                                 seed=args.seed, epochs=args.epochs)
+                                 seed=args.seed, epochs=args.epochs,
+                                 head=args.probe_head, hidden_dim=args.mlp_hidden_dim)
             print(f"  symbol_error={cell.fit.symbol_error:.4f} "
                   f"(train {cell.fit.train_symbol_error:.4f}, RS budget {cell.rs_budget:.4f}, "
                   f"chance {cell.chance_error:.4f}) -> {cell.verdict}", flush=True)

@@ -54,6 +54,7 @@ __all__ = [
     "merged_token_labels",
     "ProbeFitResult",
     "fit_linear_probe",
+    "fit_mlp_probe",
     "ProbeCellReport",
     "evaluate_cell",
     "format_report",
@@ -251,37 +252,153 @@ def fit_linear_probe(
     )
 
 
+def fit_mlp_probe(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    n_classes: int,
+    seed: int = 0,
+    epochs: int = 60,
+    hidden_dim: int = 256,
+    batch_size: int = 512,
+    lr: float = 0.05,
+    momentum: float = 0.9,
+    l2: float = 1e-4,
+) -> ProbeFitResult:
+    """NONLINEAR analog of `fit_linear_probe`: one hidden ReLU layer before the same
+    per-position softmax readout -- the `--probe-head mlp` experiment (Task 1, empirical). Same
+    input/label contract and `ProbeFitResult` shape as the linear probe (K positions per token,
+    label -1 excluded from loss and metrics), same train-only standardization, plain numpy, no
+    torch. Deterministic for fixed inputs + seed (seeded He init + seeded minibatch shuffles, no
+    other randomness).
+
+    It answers exactly the question docs/FINDINGS.md Section 5 leaves open: can a higher-capacity
+    (still cheap, still non-model) probe recover more of the symbol structure from the SAME frozen
+    embeddings than a LINEAR readout does at the same tap point? HONESTY: a PASS here that the
+    linear probe missed does NOT by itself change the end-to-end economics -- a probe is not the
+    LM, and the merged-token readout still isn't the language model USING those symbols. It means
+    the frozen embeddings carry the symbols NONLINEARLY, which is a strictly stronger claim than
+    the linear probe can make and a strictly weaker one than 'the model reads them'."""
+    if X_train.ndim != 2 or y_train.ndim != 2 or X_train.shape[0] != y_train.shape[0]:
+        raise ValueError("X_train (N,D) and y_train (N,K) must align on N")
+    if X_test.shape[1] != X_train.shape[1] or y_test.shape[1] != y_train.shape[1]:
+        raise ValueError("train/test feature dims and position counts must match")
+    if (y_train >= 0).sum() == 0:
+        raise ValueError("y_train has no valid (>= 0) labels -- nothing to fit")
+
+    rng = np.random.default_rng(seed)
+    n, dim = X_train.shape
+    k = y_train.shape[1]
+    out_dim = k * n_classes
+
+    mu = X_train.mean(axis=0)
+    sd = X_train.std(axis=0) + 1e-6
+    Xtr = ((X_train - mu) / sd).astype(np.float64)
+    Xte = ((X_test - mu) / sd).astype(np.float64)
+
+    # He init for the ReLU layer; zero init for the readout (like the linear probe's zero start,
+    # symmetric logits at step 0). W2=0 means the first step trains only W2 (from the random
+    # hidden features), after which gradient flows back into W1 -- standard, and it converges.
+    w1 = rng.standard_normal((dim, hidden_dim)) * np.sqrt(2.0 / dim)
+    b1 = np.zeros(hidden_dim)
+    w2 = np.zeros((hidden_dim, out_dim))
+    b2 = np.zeros(out_dim)
+    vw1 = np.zeros_like(w1); vb1 = np.zeros_like(b1)
+    vw2 = np.zeros_like(w2); vb2 = np.zeros_like(b2)
+
+    for _ in range(epochs):
+        order = rng.permutation(n)
+        for start in range(0, n, batch_size):
+            idx = order[start : start + batch_size]
+            xb = Xtr[idx]
+            yb = y_train[idx]
+            z1 = xb @ w1 + b1
+            h = np.maximum(z1, 0.0)
+            logits = (h @ w2 + b2).reshape(len(idx), k, n_classes)
+            probs = _softmax(logits)
+            grad = probs.copy()
+            valid = yb >= 0
+            rows, cols = np.nonzero(valid)
+            grad[rows, cols, yb[rows, cols]] -= 1.0
+            grad[~valid] = 0.0
+            n_valid = max(int(valid.sum()), 1)
+            grad = grad.reshape(len(idx), out_dim) / n_valid
+            gw2 = h.T @ grad + l2 * w2
+            gb2 = grad.sum(axis=0)
+            dh = grad @ w2.T
+            dh[z1 <= 0] = 0.0  # ReLU gradient gate
+            gw1 = xb.T @ dh + l2 * w1
+            gb1 = dh.sum(axis=0)
+            vw2 = momentum * vw2 - lr * gw2; w2 += vw2
+            vb2 = momentum * vb2 - lr * gb2; b2 += vb2
+            vw1 = momentum * vw1 - lr * gw1; w1 += vw1
+            vb1 = momentum * vb1 - lr * gb1; b1 += vb1
+
+    def _forward(X: np.ndarray) -> np.ndarray:
+        h = np.maximum(X @ w1 + b1, 0.0)
+        return (h @ w2 + b2).reshape(len(X), k, n_classes)
+
+    train_err, _ = _masked_error(_forward(Xtr), y_train)
+    test_err, per_pos = _masked_error(_forward(Xte), y_test)
+
+    return ProbeFitResult(
+        symbol_error=test_err,
+        per_position_error=per_pos.tolist(),
+        train_symbol_error=train_err,
+        n_train_positions=int((y_train >= 0).sum()),
+        n_test_positions=int((y_test >= 0).sum()),
+        n_classes=n_classes,
+        epochs=epochs,
+        seed=seed,
+    )
+
+
 @dataclass
 class ProbeCellReport:
     """One (palette, corruption) probe cell, with the verdict spelled out against the two
     reference lines that matter: chance (1 - 1/P: the probe learned nothing) and the RS budget
-    (`rs_symbol_error_budget`: the error rate below which end-to-end decode succeeds)."""
+    (`rs_symbol_error_budget`: the error rate below which end-to-end decode succeeds). `head`
+    records which probe produced `fit` ('linear' or 'mlp'), and the verdict wording is scoped to
+    it -- a PASS from the MLP head is a NONLINEAR-readability claim, not a linear one."""
 
     palette: int
     corruption: str
     fit: ProbeFitResult
     rs_budget: float
+    head: str = "linear"
     chance_error: float = field(init=False)
     verdict: str = field(init=False)
 
     def __post_init__(self) -> None:
         self.chance_error = 1.0 - 1.0 / self.palette
+        linear = self.head == "linear"
+        readout = "a linear readout" if linear else "a trained MLP (nonlinear) readout"
+        decodable = "LINEARLY-DECODABLE" if linear else "MLP-DECODABLE (nonlinear)"
+        tail = (
+            "a higher-capacity/nonlinear probe is untested and could differ"
+            if linear
+            else "this IS that higher-capacity nonlinear probe -- a readout head is still not the "
+            "LM using the symbols"
+        )
         e = self.fit.symbol_error
         if math.isnan(e):
             self.verdict = "NO VALID TEST LABELS"
         elif e <= self.rs_budget:
-            self.verdict = "BELOW RS BUDGET -- information present and linearly readable"
+            self.verdict = (
+                f"BELOW RS BUDGET -- information present and readable by {readout}"
+            )
         elif e < 0.5 * self.chance_error:
             self.verdict = (
-                "above RS budget but far below chance -- partial signal; not decodable "
-                "end-to-end at this operating point via a linear readout"
+                f"above RS budget but far below chance -- partial signal; not decodable "
+                f"end-to-end at this operating point via {readout}"
             )
         else:
             self.verdict = (
-                "at/near chance -- no LINEARLY-DECODABLE per-patch signal survives to this tap "
+                f"at/near chance -- no {decodable} per-patch signal survives to this tap "
                 "point (if this happens on CLEAN images, check the token-order assumption "
-                "first, then treat the LM-token branch as unsupported by a LINEAR probe for "
-                "this tower; a higher-capacity/nonlinear probe is untested and could differ)"
+                f"first, then treat the LM-token branch as unsupported by this probe for "
+                f"this tower; {tail})"
             )
 
 
@@ -295,14 +412,28 @@ def evaluate_cell(
     nsym: int = 32,
     seed: int = 0,
     epochs: int = 60,
+    head: str = "linear",
+    hidden_dim: int = 256,
 ) -> ProbeCellReport:
-    """Fit + verdict for one (palette, corruption) cell. Thin composition of fit_linear_probe
-    and ProbeCellReport so callers (scripts/run_probe.py, tests) share one code path."""
-    fit = fit_linear_probe(
-        X_train, y_train, X_test, y_test, n_classes=palette, seed=seed, epochs=epochs
-    )
+    """Fit + verdict for one (palette, corruption) cell. Thin composition of the chosen probe
+    head (`fit_linear_probe` for head='linear', `fit_mlp_probe` for head='mlp') and
+    ProbeCellReport, so callers (scripts/run_probe.py, tests) share one code path. `hidden_dim`
+    is used only by the MLP head. The alignment-baseline callers (scripts/train_merger_adapter.py)
+    leave head='linear' so they reproduce the committed LINEAR pre-merger number, not a new one."""
+    if head == "linear":
+        fit = fit_linear_probe(
+            X_train, y_train, X_test, y_test, n_classes=palette, seed=seed, epochs=epochs
+        )
+    elif head == "mlp":
+        fit = fit_mlp_probe(
+            X_train, y_train, X_test, y_test, n_classes=palette, seed=seed, epochs=epochs,
+            hidden_dim=hidden_dim,
+        )
+    else:
+        raise ValueError(f"unknown probe head {head!r}; use 'linear' or 'mlp'")
     return ProbeCellReport(
-        palette=palette, corruption=corruption, fit=fit, rs_budget=rs_symbol_error_budget(nsym)
+        palette=palette, corruption=corruption, fit=fit,
+        rs_budget=rs_symbol_error_budget(nsym), head=head,
     )
 
 
