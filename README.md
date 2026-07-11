@@ -5,7 +5,8 @@
 heliogram is a patch-aligned optical codec plus an evaluation harness. It encodes
 arbitrary bytes as a grid of solid-color 14x14 blocks (one symbol per ViT patch),
 protects them with Reed–Solomon ECC, runs them through the corruptions a real
-serving pipeline applies (resize, JPEG, crop/pad), and reports **effective
+serving pipeline applies (resize, JPEG, crop/pad, and the target model's own
+`smart_resize` preprocessing), and reports **effective
 bits/patch** — the channel capacity of the patch grid, measured with a model-free
 reference decoder. Format details: [`spec/format-v0.1.md`](spec/format-v0.1.md).
 
@@ -99,22 +100,23 @@ decode). (Corrected in v0.2: the earlier formula credited grid-padding
 patches as if they carried payload and overstated density by up to 3x at
 small payloads; every number in this README and RESULTS.md uses the
 corrected definition.) "Corrupted" is the mean bits/patch over every non-clean
-corruption tested: bilinear resize ±3–5%, JPEG q70–95, a slight crop/pad, and
-their composition ("combined"). Reference pixel decoder (`decode_pixels`), no
-model. Table below: 48-byte synthetic payloads, subpatch=1 (one symbol per
+corruption tested: bilinear resize ±3–5%, JPEG q70–95, a slight crop/pad,
+Qwen2.5-VL's own `smart_resize` preprocessing (two variants — see the Scope
+note above), and the resize+JPEG+crop composition ("combined"). Reference
+pixel decoder (`decode_pixels`), no model. Table below: 48-byte synthetic payloads, subpatch=1 (one symbol per
 patch — see "Capacity sweep" below for the fuller grid), nsym=32,
 patch_size=14px, 3 trials/cell.
 
 | Palette | bits/symbol | Clean bits/patch | Corrupted bits/patch |
 |--------:|------------:|-----------------:|----------------------:|
-| 2       | 1           | 0.527            | 0.527                 |
-| 4       | 2           | 1.064            | 1.064                 |
+| 2       | 1           | 0.527            | 0.410                 |
+| 4       | 2           | 1.064            | 0.827                 |
 | 8       | 3           | 1.500            | 1.500                 |
 | 16      | 4           | 2.000            | 2.000                 |
 | 32      | 5           | 2.000            | 2.000                 |
-| 64      | 6           | 2.000            | 2.000                 |
+| 64      | 6           | 2.000            | 1.556                 |
 | 128     | 7           | 1.500            | 1.500                 |
-| 256     | 8           | 0.750            | 0.536                 |
+| 256     | 8           | 0.750            | 0.583                 |
 
 The break-even line to beat is **8.096 bits/patch** (the MEASURED base64
 baseline — see Baselines); at this small (48-byte) payload every palette
@@ -122,18 +124,26 @@ here is far below it,
 including the two largest — this is a real result, not a failure to report:
 fixed overhead (32-byte RS parity + a calibration row that widens with the
 palette) is the bottleneck at 48 bytes, not palette size. For `palette` in
-`{2,4,8,16,32,64,128}`, clean and corrupted are identical at this payload
-size because `decode_success_rate` is 1.00 across the whole
+`{8,16,32,128}`, clean and corrupted are identical at this payload size
+because `decode_success_rate` is 1.00 across the whole
 realistic-serving-pipeline envelope tested here (resize ±3–5%, JPEG q70–95,
-slight crop/pad) — Reed–Solomon (nsym=32) fully absorbs the symbol errors
-that envelope introduces for those palettes at this size. (`palette=128`
-failed JPEG q70 here in earlier releases; that failure was the decoder's
-unprotected length header — fixed in v0.2 by recovering the header through
-RS — not the channel.) **That stops being true for `palette=256`:** it
-already fails JPEG q70 and the fully-composed `combined` even at this
-smallest tested payload, which is why its corrupted column (0.750→0.536) is
-measurably below its own clean column, unlike every smaller palette here —
-see `RESULTS.md` for the exact per-corruption rates. A diagnostic stress
+slight crop/pad, and — new in this revision — the target model's own
+`smart_resize` preprocessing) — Reed–Solomon (nsym=32) fully absorbs the
+symbol errors that envelope introduces for those palettes at this size, and
+those palettes' 48-byte grids happen to land on even patch dimensions, so
+`smart_resize` passes them through untouched. (`palette=128` failed JPEG q70
+here in earlier releases; that failure was the decoder's unprotected length
+header — fixed in v0.2 by recovering the header through RS — not the
+channel.) **`palette` 2, 4, and 64 are new casualties of measuring
+`smart_resize`:** their 48-byte grids have an odd patch dimension in the
+default encoding, and the mandatory 28px snap resamples every data row off
+the symbol lattice — decode drops to 0.00 for exactly those rows of the
+suite (that, not JPEG, is what pulls their corrupted means down above). The
+fix is `encode(..., align=2)`, which makes the snap a no-op — see the Scope
+note near the top of this file. **`palette=256` fails the old way:** it
+fails JPEG q70 and the fully-composed `combined` even at this smallest
+tested payload, which is why its corrupted column (0.750→0.583) is below its
+own clean column — see `RESULTS.md` for the exact per-corruption rates. A diagnostic stress
 test well outside the realistic envelope (50% resize, JPEG q10, 6px
 crop/pad, composed) finds the expected fall-off at larger palettes — decode
 success drops to 0.00 at palette≥4 under the composed stress case,
@@ -173,15 +183,23 @@ overclaiming this file exists to avoid:
   patches than base64-ing it into text tokens? An accounting comparison of
   token *count*, not bits/patch density — see below.
 
-**Bar B verdict, from the actual run: 3 of 64 configs clear the gate —
-palette=8, subpatch=2, at payload_size 1024B / 4096B / 16384B (9.741 /
-10.086 / 10.357 bits/patch clean, identical under every one of the 7 tested
-corruptions, including `combined`). None of the 3 are `subpatch=1`
-(VLM-meaningful).** At the smallest payload (48B) the same
-palette=8/subpatch=2 config now survives every corruption too (its earlier
-`combined` failure was the v0.2-fixed header bug), but its clean density
-there (5.333) is below the bar — what it lacks at 48B is amortization, not
-robustness.
+**Bar B verdict, from the actual run: 0 of 64 configs clear the gate.**
+This is a change from the previous revision (3 of 64: palette=8, subpatch=2,
+at 1KB/4KB/16KB) and the cause is the newly-measured corruption, not a
+regression in the codec: all three former clearing configs produce grids
+with an odd patch dimension in the default encoding, and the target model's
+own `qwen_smart_resize` preprocessing (now in the suite) resamples them off
+the symbol lattice — decode 0.00, worst-corruption bits/patch 0. **The
+encode-side fix restores them, measured:** re-encoding those exact configs
+with `align=2` survives the full 9-corruption suite at 1KB (9.752 clean
+bits/patch) and 4KB (10.089) — clearing the 8.0 gate again — while the 16KB
+grid (112×114 patches ≈ 2.5M px) additionally exceeds the STOCK processor's
+~1MP pixel budget (`qwen_smart_resize_1mp`) and needs the operator to widen
+`max_pixels` (a processor constructor argument, in-scope for this project's
+operator) to survive. The harness sweep itself keeps measuring the default
+(`align=1`) encoding, so these numbers stay the honest
+what-you-get-by-default story; the `align=2` remeasurement above is a
+spot-check, not a full sweep.
 
 **Bar A verdict against the MEASURED baseline: 18 of 64 configs beat base64
 density clean — every one of them `subpatch=2` (the pixel-decoder-only
@@ -240,12 +258,17 @@ Two more things this sweep found, both measured (not cherry-picked):
   monotonically worse.** At `subpatch=2`/16KB, each palette from 8 upward has
   a *higher clean* ceiling than the last (8: 10.357, 16: 13.788, 32: 17.120,
   64: 20.480, 128: 23.814, 256: 25.600 bits/patch) but fails against a
-  strictly larger set of the 7 tested corruptions: palette=16 fails only the
-  fully-composed `combined`; 32 and 64 add `JPEG q70`; 128 adds `JPEG q85`
-  too; and 256 fails `JPEG q95` as well — the *mildest* JPEG setting this
-  harness tests. Of palette 8 and up, only palette=8/subpatch=2 survives
-  every tested corruption (palette=2/4 also do, but their clean ceiling is
-  too low for the comparison to be interesting here).
+  strictly larger set of the JPEG/resize/crop corruptions: palette=16 fails
+  only the fully-composed `combined`; 32 and 64 add `JPEG q70`; 128 adds
+  `JPEG q85` too; and 256 fails `JPEG q95` as well — the *mildest* JPEG
+  setting this harness tests. (The two `qwen_smart_resize` rows added in
+  this revision fail for every palette at this 16KB tier — those grids have
+  odd patch dimensions in the default encoding — which is a grid-alignment
+  effect orthogonal to the palette-vs-JPEG story this bullet is about; see
+  the Bar B verdict above and `encode(..., align=2)`.) Of palette 8 and up,
+  only palette=8/subpatch=2 survives every JPEG/resize/crop corruption
+  (palette=2/4 also do, but their clean ceiling is too low for the
+  comparison to be interesting here).
 - **Amortization raises the floor but not the ceiling.** For `subpatch=1`,
   bits/patch rises with payload size (palette=64: 2.000 → 4.923 → 5.120 →
   5.185; palette=256: 0.750 → 5.333 → 6.400 → 6.827 bits/patch, at
@@ -413,11 +436,18 @@ sweep" above); Gate #1 is kept and reported for continuity, not as a
 sufficient condition for anything.
 
 The capacity/amortization/Gate sweep (see "Capacity sweep" above; full detail
-in `RESULTS.md`) found that **3 of the 64 tested (palette, subpatch,
-payload_size) configs clear the Gate #1 (8-bit) bar, and all 3 use
-`subpatch=2`** — the unverified, pixel-decoder-only geometric regime. **No
-`subpatch=1` (the actually VLM-meaningful regime) config clears Gate #1, and
-none can by construction at any payload size:** the hard per-symbol ceiling
+in `RESULTS.md`) found that **0 of the 64 tested (palette, subpatch,
+payload_size) configs clear the Gate #1 (8-bit) bar under the
+default encoding** — the 3 that cleared it in the previous revision (all
+`palette=8`/`subpatch=2`) are killed by the newly-measured
+`qwen_smart_resize` corruption (the model's own preprocessing) and come back
+only with the `align=2` encode-side fix (measured for 1KB/4KB; the 16KB grid
+additionally needs the operator to widen the processor's pixel budget — see
+the Bar B verdict in "Capacity sweep" above). Even setting `smart_resize`
+aside, every near-clearing config uses `subpatch=2`, the unverified,
+pixel-decoder-only geometric regime. **No `subpatch=1` (the actually
+VLM-meaningful regime) config clears Gate #1, and none can by construction
+at any payload size:** the hard per-symbol ceiling
 for `subpatch=1` is `log2(P)`, which reaches exactly 8 only at the largest
 palette, `P=256` — but Reed–Solomon/calibration overhead caps the achievable
 *net* ceiling at `log2(P) × 223/255 ≈ 6.996` bits/patch as payload size grows
