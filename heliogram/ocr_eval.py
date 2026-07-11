@@ -229,8 +229,13 @@ def render_ocr_example(
     the text, only the rendered image and geometric metrics, so this is the minimal extra step
     needed to get a scorable ground truth, not a parallel reimplementation of rendering.
     """
+    # align=2: render on a 28px-aligned (2 x 14px patch) canvas so Qwen2/2.5-VL's smart_resize is
+    # the IDENTITY on the image the model is shown. Without this the processor silently resamples
+    # every rendered canvas (odd patch dims -> not a 28px multiple) and the model grades a
+    # blurred/rescaled image, not the rendering -- see typography._layout_canvas's align docstring
+    # and scripts/run_typography_ocr.py's identity guard, which fails loudly when this is skipped.
     density = render_typeset_density(
-        payload, font_size_px, apply_rs=apply_rs, nsym=nsym, patch_size=patch_size
+        payload, font_size_px, apply_rs=apply_rs, nsym=nsym, patch_size=patch_size, align=2
     )
     stream = _rs_frame(payload, nsym) if apply_rs else bytes(payload)
     ground_truth_text = base64.a85encode(stream).decode("ascii")

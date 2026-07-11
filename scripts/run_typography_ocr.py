@@ -208,7 +208,13 @@ def _geometry_by_font_size(payload_size: int, font_sizes, nsym: int, seed: int):
     heliogram.typography.sweep_typography/load_reference_bars -- REUSED, not recomputed here."""
     bars = load_reference_bars()
     payload = random_payload(seed, payload_size)
-    rows = sweep_typography(payload, font_sizes_px=list(font_sizes), nsym=nsym, bars=bars)
+    # align=2 to match heliogram.ocr_eval.render_ocr_example: the geometry row must describe the
+    # SAME 28px-aligned canvas the model is actually shown (identity under smart_resize), so the
+    # "beats 8.374?" verdict reflects the image the OCR call graded, not a tighter unaligned
+    # canvas the processor would have resampled before the model ever saw it.
+    rows = sweep_typography(
+        payload, font_sizes_px=list(font_sizes), nsym=nsym, bars=bars, align=2
+    )
     return bars, {row.font_size_px: row for row in rows}
 
 

@@ -276,3 +276,42 @@ def test_evaluate_ocr_raises_on_processor_none():
 def test_evaluate_ocr_raises_on_both_none():
     with pytest.raises(ValueError):
         evaluate_ocr(None, None, [OcrConfig(font_size_px=10, payload_size=32)])
+
+
+def test_ocr_renders_are_smart_resize_identity():
+    """REGRESSION (the confounded first GPU run): every OCR render MUST be 28px-aligned so the
+    model's mandatory smart_resize is the identity -- otherwise the processor silently resamples
+    the canvas and the model grades a blurred image, not the rendering (the whole readability
+    measurement is then meaningless). render_ocr_example uses align=2 for exactly this. Pin it
+    across font sizes, both ECC variants, at the payload size the runner defaults to."""
+    from heliogram.corruption import QWEN_GENEROUS_MAX_PIXELS, qwen_smart_resize_dims
+
+    payload = bytes(random.Random(0).getrandbits(8) for _ in range(256))
+    for font_size in (14, 12, 10, 8):
+        for apply_rs in (False, True):
+            ex = render_ocr_example(payload, font_size, apply_rs=apply_rs)
+            w, h = ex.image.size
+            assert w % 28 == 0 and h % 28 == 0, (
+                f"OCR render fs={font_size} rs={apply_rs} is {w}x{h}, not 28px-aligned -- "
+                "smart_resize will resample it"
+            )
+            h2, w2 = qwen_smart_resize_dims(
+                h, w, min_pixels=28 * 28, max_pixels=QWEN_GENEROUS_MAX_PIXELS
+            )
+            assert (w, h) == (w2, h2), (
+                f"OCR render fs={font_size} rs={apply_rs} is NOT smart_resize-identity: "
+                f"{w}x{h} -> {w2}x{h2}"
+            )
+
+
+def test_typography_default_geometry_unchanged_by_align_param():
+    """The align parameter must default to 1 so heliogram.typography's own pinned geometry numbers
+    (test_typography.py) are untouched -- only the OCR path opts into align=2."""
+    from heliogram.typography import render_typeset_density
+
+    payload = bytes(range(64))
+    default = render_typeset_density(payload, 12, apply_rs=True)
+    explicit1 = render_typeset_density(payload, 12, apply_rs=True, align=1)
+    assert default.image.size == explicit1.image.size
+    assert default.total_patches == explicit1.total_patches
+    assert default.bits_per_patch == explicit1.bits_per_patch

@@ -179,24 +179,33 @@ def _rs_frame(payload: bytes, nsym: int) -> bytes:
 
 
 def _layout_canvas(
-    text_len: int, char_w: float, line_h: int, patch_size: int
+    text_len: int, char_w: float, line_h: int, patch_size: int, align: int = 1
 ) -> Tuple[int, int, int, int]:
-    """Size a square-ish canvas (in whole `patch_size`-px multiples, so margins/padding needed to
-    round up are counted -- never cropped away) that fits `text_len` monospace characters of
-    advance width `char_w` and line height `line_h`, and return
+    """Size a square-ish canvas (in whole `align * patch_size`-px multiples, so margins/padding
+    needed to round up are counted -- never cropped away) that fits `text_len` monospace
+    characters of advance width `char_w` and line height `line_h`, and return
     (chars_per_line, n_lines, canvas_w_px, canvas_h_px).
 
-    Same square-ish/ceil-to-patch-multiple sizing convention as
-    heliogram.baselines.rendered_text_density, generalized from a crude `font.getbbox("M")`
-    estimate to exact FreeType advance-width/line-height metrics.
+    `align` (default 1: round to whole `patch_size`-px multiples, the original convention shared
+    with heliogram.baselines.rendered_text_density) rounds BOTH canvas dimensions up to a multiple
+    of `align * patch_size` px. `align=2` yields dimensions that are multiples of `2 * patch_size`
+    = 28px at the default 14px patch -- exactly the snap unit of Qwen2/2.5-VL's `smart_resize`, so
+    a canvas laid out with `align=2` is fed to the model as the IDENTITY transform (no
+    uncontrolled resample onto a different pixel grid before the ViT reads it), the same reason
+    heliogram.codec.encode grew its own `align` parameter. This is REQUIRED, not cosmetic, for the
+    readability measurement in heliogram.ocr_eval: without it every rendered OCR image hits
+    smart_resize and the model grades a resampled (blurred/rescaled) image, not the rendering (see
+    that module + scripts/run_typography_ocr.py's identity guard). The extra padding patches are
+    counted against bits/patch honestly, exactly as the color codec's align padding is.
     """
+    unit = align * patch_size
     target_w_px = max(
-        patch_size,
-        math.ceil(math.sqrt(max(text_len, 1)) * char_w / patch_size) * patch_size,
+        unit,
+        math.ceil(math.sqrt(max(text_len, 1)) * char_w / unit) * unit,
     )
     chars_per_line = max(1, int(target_w_px // char_w))
     n_lines = max(1, math.ceil(text_len / chars_per_line))
-    target_h_px = max(patch_size, math.ceil(n_lines * line_h / patch_size) * patch_size)
+    target_h_px = max(unit, math.ceil(n_lines * line_h / unit) * unit)
     return chars_per_line, n_lines, target_w_px, target_h_px
 
 
@@ -231,10 +240,19 @@ def render_typeset_density(
     apply_rs: bool = False,
     nsym: int = DEFAULT_NSYM,
     patch_size: int = PATCH_SIZE,
+    align: int = 1,
 ) -> TypesetDensity:
     """Typeset `payload` as ascii85 text (base64.a85encode -- the strongest measured text
     encoding, see module docstring) at `font_size_px` into an image sized on the `patch_size`
     grid, and report the GEOMETRIC (model-free, perfect-legibility) bits/patch.
+
+    `align` (default 1: byte-identical geometry to prior releases -- every pinned bits/patch
+    number in this module's tests is `align=1`) rounds the rendered canvas up to `align *
+    patch_size`-px multiples in both dimensions -- see `_layout_canvas`. `align=2` makes the
+    canvas a multiple of 28px so Qwen2/2.5-VL's `smart_resize` is the identity on it, which is
+    what heliogram.ocr_eval passes for the readability measurement (an unaligned canvas is
+    silently resampled by the processor before the model reads it). The extra padding patches
+    lower bits/patch honestly, exactly as the color codec's `align=2` padding does.
 
     `apply_rs=False` (default): typesets `ascii85(payload)` directly -- NO error correction. Fair
     comparison against the measured text-TOKEN bars (base64/ascii85 bits/token), which likewise
@@ -260,7 +278,7 @@ def render_typeset_density(
     line_h = max(1, ascent + descent)
 
     chars_per_line, n_lines, canvas_w, canvas_h = _layout_canvas(
-        len(text), char_w, line_h, patch_size
+        len(text), char_w, line_h, patch_size, align
     )
 
     image = Image.new("L", (canvas_w, canvas_h), 255)
@@ -369,19 +387,27 @@ def sweep_typography(
     nsym: int = DEFAULT_NSYM,
     patch_size: int = PATCH_SIZE,
     bars: Optional[ReferenceBars] = None,
+    align: int = 1,
 ) -> List[TypographyRow]:
     """Run `render_typeset_density` for both ecc variants at every font size in `font_sizes_px`,
     and compare each RS-framed bits/patch against `bars` (loaded via `load_reference_bars()` if
     not given). Returns one `TypographyRow` per font size, in the same order as `font_sizes_px`.
+
+    `align` (default 1) is forwarded to `render_typeset_density` -- pass `align=2` to report the
+    density of the SAME 28px-aligned canvas heliogram.ocr_eval actually feeds the model, so the
+    "beats 8.374?" verdict reflects the image the model sees (identity under smart_resize), not a
+    tighter unaligned canvas the processor would have resampled anyway.
     """
     if bars is None:
         bars = load_reference_bars()
 
     rows: List[TypographyRow] = []
     for size in font_sizes_px:
-        raw = render_typeset_density(payload, size, apply_rs=False, patch_size=patch_size)
+        raw = render_typeset_density(
+            payload, size, apply_rs=False, patch_size=patch_size, align=align
+        )
         rs = render_typeset_density(
-            payload, size, apply_rs=True, nsym=nsym, patch_size=patch_size
+            payload, size, apply_rs=True, nsym=nsym, patch_size=patch_size, align=align
         )
         rows.append(
             TypographyRow(
