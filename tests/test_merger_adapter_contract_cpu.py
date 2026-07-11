@@ -108,6 +108,25 @@ def test_cli_default_invocation_hits_the_refuse_guard():
     assert "HONEST-REPORTING CAVEAT" in result.stdout
 
 
+def test_driver_cli_help_does_not_require_torch():
+    """scripts/drive_merger_adapter.py is the REAL-RUN driver (it loads a model and calls
+    run_design_a/b), but importing it and running --help must still work with zero GPU packages:
+    the only torch import is function-local in run_probe._load_tower, reached exclusively during
+    an actual run. Guards the same torch-free-import invariant the scaffold itself keeps, so the
+    driver can't silently grow a top-level `import torch` that breaks `--help` on a CPU box."""
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "drive_merger_adapter.py"), "--help"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "torch" not in result.stderr.lower()
+    for flag in ("--design", "--palette", "--corruptions", "--budget-cap-usd"):
+        assert flag in result.stdout, f"{flag} missing from driver --help output"
+
+
 # --- refuse-without-model guards (in-process, no subprocess needed) ---------------------------
 
 
