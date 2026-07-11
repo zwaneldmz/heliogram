@@ -940,14 +940,24 @@ def run_design_b(
     head = _QuadReadoutHead(
         in_features=out_features, hidden_dim=hidden_dim, palette=palette
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        [p for p in trainable_module.parameters() if p.requires_grad] + list(head.parameters()),
-        lr=lr,
-    )
+    # Snapshot the fresh-init weights so EACH corruption is trained INDEPENDENTLY from the same
+    # starting point (reset inside the loop). Without this the loop trained cumulatively -- clean,
+    # then jpeg on the already-clean-trained weights -- so the second corruption's number
+    # reflected forgetting/divergence (measured at/near chance), not a fair per-corruption train.
+    _init_trainable_state = {k: v.detach().clone() for k, v in trainable_module.state_dict().items()}
+    _init_head_state = {k: v.detach().clone() for k, v in head.state_dict().items()}
 
     rs_budget = rs_symbol_error_budget(nsym)
     per_corruption = []
     for cname in corruptions:
+        # Independent per-corruption training: reset to fresh init + a brand-new optimizer, so
+        # this corruption trains from scratch and its number is comparable across corruptions.
+        trainable_module.load_state_dict(_init_trainable_state, strict=False)
+        head.load_state_dict(_init_head_state)
+        optimizer = torch.optim.AdamW(
+            [p for p in trainable_module.parameters() if p.requires_grad] + list(head.parameters()),
+            lr=lr,
+        )
         cfn = CORRUPTIONS[cname]
         train_examples = list(
             generate_examples(
