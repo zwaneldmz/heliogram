@@ -316,6 +316,159 @@ model, measure `foreign_tile.guard`'s TPR/FPR against tiles the *tuned* model re
 publish both alongside any adapter — the decision rule is written down in the README so it
 can't be softened after the fact.
 
+## 6. GPU repro cost per row (estimate, derived from the committed probe reports)
+
+**None of the committed `probe_report*.json` files contain wall-clock or dollar-cost metadata**
+— each JSON cell records `n_train_positions`/`n_test_positions`/`n_classes`/`epochs`/`seed` only
+(see e.g. `probe_report.json`'s per-cell `fit` block). Everything below is therefore an
+**ESTIMATE derived from the reports' own configuration fields (model, palettes, corruptions,
+image counts) plus the runtime assumptions this repo already states elsewhere** — not a
+measured benchmark. It is flagged as an estimate throughout; do not treat any number in this
+section as a committed result the way `probe_report*.md`'s symbol-error numbers are.
+
+### 6.1 What actually costs GPU time here
+
+Per `heliogram/probe.py` and `scripts/run_probe.py`: the frozen-tower probe does **one forward
+pass per image** through the (frozen, no-gradient) vision tower to extract embeddings; the
+linear-probe fit itself (`fit_linear_probe`, up to 60 epochs) is plain numpy on the CPU and is
+negligible next to a real vision-tower forward pass. So GPU time per report is proportional to
+**total images processed** = sum over cells of `(n_train_images + n_test_images)`, since each
+`(palette, corruption)` cell in `scripts/run_probe.py`'s `main()` generates and forwards its own
+fresh set of images (`_cell_arrays`, called independently per cell — confirmed by reading
+`scripts/run_probe.py`'s `main`, not assumed).
+
+### 6.2 Per-row image counts, read directly from each committed report's config
+
+| Report | Model | Cells (palette × corruption) | Images/cell (train+test) | Total images |
+|---|---|---:|---:|---:|
+| `probe_report.md` | 3B | 3 palettes × 3 corruptions = 9 | 6+3 = 9 | 81 |
+| `probe_report_7b.md` | 7B | 2 palettes × 1 corruption = 2 | 6+3 = 9 | 18 |
+| `probe_report_premerger.md` | 3B, pre-merger tap | 2 palettes × 2 corruptions = 4 | 6+3 = 9 | 36 |
+| `probe_report_easy.md` | 3B | 2 palettes × 1 corruption = 2 | 12+4 = 16 | 32 |
+
+(Cell/image counts read from each `.md`/`.json`'s rows and from the commands in section 2/2.5
+above that produced them — `--n-train-images`/`--n-test-images` per invocation — not
+re-derived from any timing data, since none exists in the committed files.)
+
+### 6.3 Rough per-row and per-report time/cost estimate (FLAGGED: estimate, not measured)
+
+Anchoring assumptions (stated so they can be checked/replaced against a real GPU session):
+
+- This file's own section 2 header already characterizes the whole multi-cell `probe_report.md`
+  run as **"~minutes"** on one GPU — the only runtime claim this repo makes anywhere for this
+  step. Spread over 81 images, that is roughly **2–5 seconds of GPU time per image** for the 3B
+  tower in bf16 (forward pass + processor overhead), which is the per-image rate used below.
+- `scripts/train_merger_adapter.py`'s own cost-estimate module (`estimate_runtime_seconds`)
+  independently assumes **0.5 s/image** for a single frozen forward pass with no backprop
+  (its `DESIGN_A_SECONDS_PER_IMAGE` constant) — a lower bound consistent with, and cheaper than,
+  the 2–5 s/image range above (that script's number excludes processor/dataset generation
+  overhead this estimate includes, so a difference in the same direction is expected, not a
+  contradiction).
+- The 7B tower is assumed **~1.5–2×** the 3B per-image cost (larger vision tower forward pass);
+  no 7B timing is available anywhere in this repo to check that multiplier against, so treat it
+  as the least-certain part of this estimate.
+
+| Report | Images | Assumed s/image | Estimated GPU time | Estimated cost @ $2/GPU-hr |
+|---|---:|---:|---:|---:|
+| `probe_report.md` (3B) | 81 | 2–5 | ~3–7 min | ~$0.10–$0.25 |
+| `probe_report_7b.md` (7B) | 18 | 3–10 | ~1–3 min | ~$0.05–$0.10 |
+| `probe_report_premerger.md` (3B, pre-merger) | 36 | 2–5 | ~1–3 min | ~$0.05–$0.10 |
+| `probe_report_easy.md` (3B) | 32 | 2–5 | ~1–3 min | ~$0.05–$0.10 |
+| **All four, one session** | **167** | — | **~10–20 min** (plus ~1–2 model-load events) | **~$0.30–$0.60** |
+
+`$2/GPU-hour` is the same rented-GPU rate assumption `scripts/train_merger_adapter.py` uses
+(`GPU_HOURLY_RATE_USD_DEFAULT`), kept here for consistency rather than re-derived — adjust
+linearly for your actual rented rate. **Bottom line, consistent with every prior claim in this
+file: the frozen-encoder probe is cheap — single-digit minutes and well under $1 per report,
+tens of minutes and roughly $1 for a full from-scratch reproduction of every committed
+`probe_report*` file** — small enough that re-running all of section 2/2.5 to sanity-check a
+new environment (e.g. to satisfy `scripts/train_merger_adapter.py`'s alignment assert, section 7
+below) is not a meaningful cost concern relative to any of the training stages further down
+this file.
+
+## 7. Merger-adapter go/no-go (`scripts/train_merger_adapter.py`, Design A then B)
+
+This is the staged next test after the pre/post-merger localization in section 2.5 — it asks
+whether *training* the merger (not just reading it linearly, frozen, the way Step 0's probe
+does) can recover the palette=16 signal the pre-merger probe already showed the vision blocks
+still carry (`probe_report_premerger.md`: 13.4% clean / 19.0% jpeg_q70) even though it is
+destroyed post-merger (`probe_report.md`/`probe_report_7b.md`: 65.5–73.6%). **This has not been
+run against real weights anywhere in this repo — there is no GPU here.** It is a designed,
+CPU-contract-tested (`tests/test_merger_adapter_contract_cpu.py`), REFUSING scaffold: its CLI
+entry point never loads a model itself and always raises before touching torch (see the
+script's own module docstring, "REAL INVOCATION"). To actually run either design, drive it from
+a GPU-side Python driver that has already loaded a real tower:
+
+```python
+from scripts.run_probe import _load_tower       # the exact loader run_probe.py's main() uses
+model, processor, dtype = _load_tower("Qwen/Qwen2.5-VL-3B-Instruct", "cuda", "bfloat16")
+
+import scripts.train_merger_adapter as tma
+
+# Design A first: cheap, no-backprop diagnostic -- does a NONLINEAR readout on the SAME frozen
+# pre-merger embeddings the linear probe already used recover more signal than Step 0 measured?
+report_a = tma.run_design_a(model, processor, dtype=dtype, device="cuda")
+
+# Design B: the actual gate -- LoRA-tunes (or B2 parallel-adapts) ONLY the merger MLP, jointly
+# with a trained readout head, gradients flowing into the merger's own parameters.
+report_b = tma.run_design_b(model, processor, dtype=dtype, device="cuda", variant="B1")
+```
+
+**Alignment sanity assert — run this first, every time.** Both `run_design_a` and
+`run_design_b` re-run the exact (palette=16, clean, pre_merger) probe cell
+`probe_report_premerger.md` was generated from, before trusting any new number, and raise
+`RuntimeError` unless the result reproduces the committed **13.4%** clean symbol error
+(`PREMERGER_CLEAN_SYMBOL_ERROR = 0.1344`) within a fixed tolerance (`ALIGNMENT_TOLERANCE =
+0.02`, i.e. must land in roughly 11.4–15.4%). This is not optional or skippable from the CLI —
+it is the first thing either design's real-run path does. If it fails, a GPU session's
+transformers/peft version, model id, or window-shuffle handling has drifted since
+`probe_report_premerger.md` was generated (`transformers==5.13.0`) — **do not trust any further
+number from that session until this reproduces.** Both designs are hard-pinned to
+`palette=16` only; any other palette raises immediately (`probe_report_premerger.md` already
+measured `palette=256` at/near chance even pre-merger, 80.8% clean, so no merger-side adapter
+could recover it regardless of training).
+
+**Per-run cost estimate — tens of dollars, by the script's own design.** The script's own
+`estimate_cost_usd`/`check_budget` machinery (pure Python, no torch, unit-tested in
+`tests/test_merger_adapter_contract_cpu.py`) is the authoritative estimate here, not a
+number recomputed independently in this runbook:
+
+- **Design A** (`DESIGN_A_SECONDS_PER_IMAGE = 0.5`s): one frozen forward pass per image, no
+  backprop — at the CLI's default `--n-train-images 6 --n-test-images 3`, that is
+  `estimate_cost_usd("a", 6, 3, epochs)` ≈ 4.5s of GPU time regardless of epoch count (the numpy
+  head-fit epochs are CPU-side and excluded from the GPU estimate) — cents, not dollars, at the
+  default `$2`/GPU-hour rate. Cheap enough that it should always be run before Design B.
+- **Design B** (`DESIGN_B_SECONDS_PER_TRAIN_STEP = 2.5`s per training image per epoch, plus
+  `DESIGN_B_SECONDS_PER_EVAL_IMAGE = 0.5`s per eval image): real backprop through the merger
+  LoRA/adapter parameters across `--epochs` passes. At the CLI's shared `--epochs` default (60)
+  and `--n-train-images 6 --n-test-images 3`, `estimate_cost_usd("b", 6, 3, 60)` ≈ 900s ≈ 0.25
+  GPU-hours ≈ **$0.50 at $2/GPU-hour for one corruption** — note the estimator takes a single
+  `epochs`/image count and does **not** itself multiply by `len(corruptions)`, even though
+  `run_design_b`'s real loop trains once per requested corruption, so the true cost for the
+  default two corruptions (`clean,jpeg_q70`) is roughly **2×** this printed estimate (~$1), a gap
+  worth knowing about before trusting the printed number at face value. Reaching the
+  **tens-of-dollars** range this section's title refers to requires deliberately scaling up
+  `--n-train-images`/`--epochs` beyond the tiny diagnostic defaults (e.g. dozens of images and
+  hundreds of epochs) for a more thorough gate run — the script's own module docstring is
+  explicit that its per-cell diagnostic run "should cost a small fraction of" the tens-of-dollars
+  ceiling by design, not consume the whole thing.
+- `check_budget` **aborts before any GPU spend** if the projected cost exceeds
+  `--budget-cap-usd` (default `$40` — the same tens-of-dollars ceiling `RUNBOOK-GPU.md` section
+  2.5 already uses for the full p16 merger curriculum, `BUDGET_CAP_USD_DEFAULT`'s own comment
+  cites it directly) — this cap is a ceiling not to exceed, not a target cost; raise it
+  explicitly only after reviewing the printed projected cost (and remembering the
+  per-corruption multiplier above), never silently.
+
+**Reading the result:** per the script's own `HONEST_CAVEAT_TEXT` — a trained readout head is
+not the language model. Design-B success (error at/below the RS budget, or clearly below the
+stock frozen-merger baseline of 65.5–73.6%) means the palette=16 signal *can* be made
+recoverable at the LM boundary by a cheaply-trained merger, which reopens the fine-tune question
+(see section 2.5's "If (d)/(e) pass" subsection) — it does **not** prove a zero-shot LM already
+uses those symbols, or that the economics ultimately win. If Design B stays at or above the
+frozen-merger baseline despite training, the negative result is **stronger** than Step 0's own
+merged-probe fail: even a cheaply-trained, code-aware merger cannot carry the signal, scoped to
+Qwen2.5-VL.
+
 ## What to bring back into the repo
 
 1. `heliogram/data/base64_baseline.json` + `heliogram/data/text_baselines.json` (step 1)
@@ -325,3 +478,7 @@ can't be softened after the fact.
 5. if step 4 ran: per-stage accuracy logs and the final adapter's measured
    symbol-error/decode-success table — numbers, not the checkpoint's existence, are the
    result
+6. if section 7 (merger-adapter go/no-go) ran: both designs' full report dicts (config,
+   alignment-check result, per-corruption symbol errors, and the printed cost estimate) —
+   commit these the same way `probe_report*.md`/`.json` are committed, verbatim, whichever way
+   the result comes out.
