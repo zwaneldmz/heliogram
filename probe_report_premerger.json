@@ -1,0 +1,78 @@
+[
+  {
+    "palette": 16,
+    "corruption": "clean",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.9375,
+    "verdict": "above RS budget but far below chance -- partial signal; not decodable end-to-end at this operating point via a linear readout",
+    "fit": {
+      "symbol_error": 0.13442176870748299,
+      "per_position_error": [
+        0.13442176870748299
+      ],
+      "train_symbol_error": 0.001564625850340136,
+      "n_train_positions": 14700,
+      "n_test_positions": 7350,
+      "n_classes": 16,
+      "epochs": 60,
+      "seed": 0
+    }
+  },
+  {
+    "palette": 16,
+    "corruption": "jpeg_q70",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.9375,
+    "verdict": "above RS budget but far below chance -- partial signal; not decodable end-to-end at this operating point via a linear readout",
+    "fit": {
+      "symbol_error": 0.19020408163265307,
+      "per_position_error": [
+        0.19020408163265307
+      ],
+      "train_symbol_error": 0.01197278911564626,
+      "n_train_positions": 14700,
+      "n_test_positions": 7350,
+      "n_classes": 16,
+      "epochs": 60,
+      "seed": 0
+    }
+  },
+  {
+    "palette": 256,
+    "corruption": "clean",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.99609375,
+    "verdict": "at/near chance -- embeddings do not linearly separate the symbols here (if this happens on CLEAN images, check the token-order assumption first, then treat the LM-token branch as unsupported for this tower)",
+    "fit": {
+      "symbol_error": 0.8080729166666667,
+      "per_position_error": [
+        0.8080729166666667
+      ],
+      "train_symbol_error": 0.012369791666666666,
+      "n_train_positions": 7680,
+      "n_test_positions": 3840,
+      "n_classes": 256,
+      "epochs": 60,
+      "seed": 0
+    }
+  },
+  {
+    "palette": 256,
+    "corruption": "jpeg_q70",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.99609375,
+    "verdict": "at/near chance -- embeddings do not linearly separate the symbols here (if this happens on CLEAN images, check the token-order assumption first, then treat the LM-token branch as unsupported for this tower)",
+    "fit": {
+      "symbol_error": 0.8192708333333333,
+      "per_position_error": [
+        0.8192708333333333
+      ],
+      "train_symbol_error": 0.004296875,
+      "n_train_positions": 7680,
+      "n_test_positions": 3840,
+      "n_classes": 256,
+      "epochs": 60,
+      "seed": 0
+    }
+  }
+]

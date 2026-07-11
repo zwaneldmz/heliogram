@@ -1,0 +1,46 @@
+[
+  {
+    "palette": 2,
+    "corruption": "clean",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.5,
+    "verdict": "above RS budget but far below chance -- partial signal; not decodable end-to-end at this operating point via a linear readout",
+    "fit": {
+      "symbol_error": 0.18313234384662955,
+      "per_position_error": [
+        0.19950020824656392,
+        0.1908579758433986,
+        0.1829591836734694,
+        0.1596938775510204
+      ],
+      "train_symbol_error": 0.14932488146773862,
+      "n_train_positions": 116424,
+      "n_test_positions": 38808,
+      "n_classes": 2,
+      "epochs": 60,
+      "seed": 0
+    }
+  },
+  {
+    "palette": 4,
+    "corruption": "clean",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.75,
+    "verdict": "above RS budget but far below chance -- partial signal; not decodable end-to-end at this operating point via a linear readout",
+    "fit": {
+      "symbol_error": 0.33291925465838507,
+      "per_position_error": [
+        0.3550420168067227,
+        0.3716386554621849,
+        0.29918367346938773,
+        0.3075510204081633
+      ],
+      "train_symbol_error": 0.2480503795721187,
+      "n_train_positions": 57960,
+      "n_test_positions": 19320,
+      "n_classes": 4,
+      "epochs": 60,
+      "seed": 0
+    }
+  }
+]

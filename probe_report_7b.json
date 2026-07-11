@@ -1,0 +1,46 @@
+[
+  {
+    "palette": 16,
+    "corruption": "clean",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.9375,
+    "verdict": "at/near chance -- embeddings do not linearly separate the symbols here (if this happens on CLEAN images, check the token-order assumption first, then treat the LM-token branch as unsupported for this tower)",
+    "fit": {
+      "symbol_error": 0.6551020408163265,
+      "per_position_error": [
+        0.6477777777777778,
+        0.6161111111111112,
+        0.6858666666666666,
+        0.6688
+      ],
+      "train_symbol_error": 0.11095238095238096,
+      "n_train_positions": 14700,
+      "n_test_positions": 7350,
+      "n_classes": 16,
+      "epochs": 60,
+      "seed": 0
+    }
+  },
+  {
+    "palette": 256,
+    "corruption": "clean",
+    "rs_budget": 0.06274509803921569,
+    "chance_error": 0.99609375,
+    "verdict": "at/near chance -- embeddings do not linearly separate the symbols here (if this happens on CLEAN images, check the token-order assumption first, then treat the LM-token branch as unsupported for this tower)",
+    "fit": {
+      "symbol_error": 0.8979166666666667,
+      "per_position_error": [
+        0.97265625,
+        0.9661458333333334,
+        0.8532986111111112,
+        0.8472222222222222
+      ],
+      "train_symbol_error": 0.0020833333333333333,
+      "n_train_positions": 7680,
+      "n_test_positions": 3840,
+      "n_classes": 256,
+      "epochs": 60,
+      "seed": 0
+    }
+  }
+]
