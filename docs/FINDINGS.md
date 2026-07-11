@@ -188,6 +188,24 @@ Reading this table with the two tap points side by side is the whole finding:
   merger's job is to fold 4 ViT-patch embeddings into 1 language-visible
   token; that fold is measured here to erase most of the linearly-recoverable,
   fine-grained color-symbol information the blocks upstream still held.
+
+> **Session addendum (single CPU/fp32 run, unreplicated — pending GPU confirmation).**
+> The committed **13.4%** pre-merger `palette=16` clean number was measured at
+> `scripts/run_probe.py`'s default probe config (6 train / 3 test images). A
+> higher-probe-data follow-up this session (Qwen2.5-VL-3B, **CPU, float32**, 48
+> train / 12 test images) measured the *same* pre-merger clean cell at **0.0700**
+> (train 0.0322) — essentially **at** the 0.0627 RS budget — with everything but
+> the probe's training-set size held fixed (the same box measured 0.1322 at 6
+> images). This indicates the committed 0.1344 was **undertrained**, not a
+> tap-point ceiling: the vision blocks preserve the per-patch `palette=16` signal
+> *nearly to the decode threshold*, which sharpens (does not overturn) the
+> localization above — the loss is concentrated even more squarely at the 2×2
+> merger (≈0.07 pre-merger → 0.66–0.74 post-merger). This is **one CPU/fp32 run**
+> (`gpu_gonogo_out/probe_pre_big.json`); it does not yet revise the headline
+> `probe_report*.md` numbers, which stand until an independent GPU run reproduces
+> the ~0.07. The same run's Design-A nonlinear quad readout landed at 0.157
+> (train 0.000) — still data-limited on the harder joint 4-symbol task, i.e. a
+> floor-not-a-ceiling, consistent with the 0.07 per-patch estimate.
 - **`palette=2`/`4` (the easiest, lowest-bit-depth codes) leave a comparable
   partial-but-undecodable signal even post-merger** (`probe_report_easy.md`:
   18.3%/33.3% error against 50%/75% chance) — consistent with the same
