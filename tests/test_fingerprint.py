@@ -41,7 +41,7 @@ from heliogram.instruments.fingerprint import (
 
 
 def test_import_fingerprint_does_not_pull_in_torch():
-    from conftest import assert_import_stays_torch_free
+    from tests.conftest import assert_import_stays_torch_free
 
     assert_import_stays_torch_free("heliogram.instruments.fingerprint")
 
@@ -449,6 +449,6 @@ def test_cli_help_does_not_require_torch_and_lists_flags():
     help_text = parser.format_help()
     assert "--palette" in help_text
     assert "--threshold" in help_text
-    from conftest import assert_import_stays_torch_free
+    from tests.conftest import assert_import_stays_torch_free
 
     assert_import_stays_torch_free("heliogram.instruments.fingerprint")

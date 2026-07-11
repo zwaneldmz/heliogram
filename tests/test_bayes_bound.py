@@ -47,7 +47,7 @@ from heliogram.instruments.bayes_bound import (
 
 
 def test_import_bayes_bound_does_not_pull_in_torch():
-    from conftest import assert_import_stays_torch_free
+    from tests.conftest import assert_import_stays_torch_free
 
     assert_import_stays_torch_free("heliogram.instruments.bayes_bound")
 

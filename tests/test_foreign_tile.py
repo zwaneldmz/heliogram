@@ -44,7 +44,7 @@ DEFAULT_ALLOWLIST = (AllowListEntry(palette=8), AllowListEntry(palette=16))
 
 
 def test_import_foreign_tile_does_not_pull_in_torch():
-    from conftest import assert_import_stays_torch_free
+    from tests.conftest import assert_import_stays_torch_free
 
     assert_import_stays_torch_free("heliogram.instruments.foreign_tile")
 

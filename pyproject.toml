@@ -45,6 +45,16 @@ gpu = [
 [tool.setuptools.packages.find]
 include = ["heliogram*"]
 
+[tool.pytest.ini_options]
+# Prepend the repo root to sys.path during collection so `from tests.conftest import ...` and
+# `import heliogram` always resolve to THIS checkout -- never a stale copy sitting in
+# site-packages/dist-packages. Some prebuilt GPU images (e.g. RunPod) ship or accumulate a
+# shadow `tests`/`heliogram` package there; without this, pytest imported the wrong conftest
+# ("cannot import name 'assert_import_stays_torch_free'") and collection failed. tests/ has no
+# __init__.py, so this is what makes the local `tests` namespace authoritative.
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.setuptools.package-data]
 # Ships heliogram/data/base64_baseline.json (heliogram.baselines' persisted, tokenizer-measured
 # base64 bits/token baseline -- see MEASURED_BASELINE_PATH/measure_base64_baseline/

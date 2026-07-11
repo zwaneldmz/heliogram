@@ -32,7 +32,7 @@ from heliogram.instruments.saliency import (
 
 
 def test_import_saliency_does_not_pull_in_torch():
-    from conftest import assert_import_stays_torch_free
+    from tests.conftest import assert_import_stays_torch_free
 
     assert_import_stays_torch_free("heliogram.instruments.saliency")
 

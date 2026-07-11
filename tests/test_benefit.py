@@ -72,7 +72,7 @@ def test_import_heliogram_benefit_does_not_pull_in_torch_or_transformers():
     attempted -- never merely by importing this module. Mirrors test_phase2_scaffold.py's/
     test_patchsize.py's equivalent checks for heliogram.vlm/heliogram.patchsize. Subprocess-
     isolated: see tests/conftest.py."""
-    from conftest import assert_import_stays_torch_free
+    from tests.conftest import assert_import_stays_torch_free
 
     assert_import_stays_torch_free("heliogram.benefit")
 

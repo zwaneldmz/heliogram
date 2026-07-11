@@ -36,7 +36,7 @@ def test_import_heliogram_patchsize_does_not_pull_in_torch():
     heliogram.vlm): `import heliogram.patchsize` must never require torch/transformers, since
     verify_patch_size only ever reads attributes off caller-supplied objects -- it never loads a
     model itself. Subprocess-isolated: see tests/conftest.py."""
-    from conftest import assert_import_stays_torch_free
+    from tests.conftest import assert_import_stays_torch_free
 
     assert_import_stays_torch_free("heliogram.patchsize")
 
