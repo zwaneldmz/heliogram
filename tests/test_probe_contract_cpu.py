@@ -75,6 +75,31 @@ def processor_shim():
     return _Shim()
 
 
+def test_every_name_main_references_is_defined():
+    """Regression guard for a real bug: an edit once swallowed `def _load_tower(...)`, leaving
+    its body as unreachable-but-syntactically-valid code inside the previous function -- the
+    file imported fine and every shim-based contract test passed, then main() crashed with
+    NameError on the GPU box. Walk main()'s (and the module's other functions') global-name
+    references and assert each resolves, so a dangling reference fails HERE, not on a pod."""
+    import builtins
+    import dis
+
+    rp = _load_run_probe()
+    for fn_name in ("main", "_parse_args", "_load_tower", "_extract_embeddings",
+                    "_extract_pre_merger_embeddings", "_cell_arrays",
+                    "_merged_embeddings_tensor", "_match_reverse_indices",
+                    "_resolve_visual_tower"):
+        fn = getattr(rp, fn_name, None)
+        assert callable(fn), f"run_probe.{fn_name} is missing or not callable"
+        for instr in dis.get_instructions(fn):
+            if instr.opname == "LOAD_GLOBAL":
+                name = instr.argval
+                assert hasattr(rp, name) or hasattr(builtins, name), (
+                    f"run_probe.{fn_name} references global {name!r}, which does not exist in "
+                    "the module -- a dangling reference that would NameError at runtime"
+                )
+
+
 def test_resolve_visual_tower_handles_5x_layout(tiny_model):
     rp = _load_run_probe()
     tower = rp._resolve_visual_tower(tiny_model)

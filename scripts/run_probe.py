@@ -256,6 +256,9 @@ def _extract_pre_merger_embeddings(visual, pixel_values, grid_thw, n_units: int)
         )
     units = merger_in.reshape(n_units, 4, hidden)
     return units[reverse].reshape(seq_len, hidden), pooled, reverse
+
+
+def _load_tower(model_id: str, device: str, dtype_name: str):
     """Load the full model once, keep only what the probe needs (the visual tower + processor).
     The load call itself is untested against real WEIGHTS in this repo (no HF Hub access/GPU
     here), but the attribute layout, call signature, and output contract it relies on are
