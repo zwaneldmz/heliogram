@@ -248,25 +248,42 @@ DESIGN_B_SECONDS_PER_EVAL_IMAGE = 0.5
 
 
 def estimate_runtime_seconds(
-    design: str, n_train_images: int, n_test_images: int, epochs: int
+    design: str, n_train_images: int, n_test_images: int, epochs: int, n_corruptions: int = 1
 ) -> float:
     """Deterministic, pure-Python projected wall-clock time (seconds) for one `run_design_a`/
     `run_design_b` call, given the same knobs that actually determine its real workload size.
     Never touches torch, never measures anything -- see the module-level constants' comments for
-    the (conservative, unverified -- no GPU here to verify against) per-unit-of-work assumptions
-    this multiplies out. Raises ValueError for any `design` other than 'a'/'b'."""
-    if n_train_images < 0 or n_test_images < 0 or epochs < 0:
+    the (unverified -- no GPU here to verify against) per-unit-of-work assumptions this multiplies
+    out. Raises ValueError for any `design` other than 'a'/'b'.
+
+    Accounts for BOTH pieces of the real workload `run_design_a`/`run_design_b` execute:
+      (1) the one-time palette=16/clean alignment sanity cell
+          (`_measure_premerger_clean_symbol_error`) -- one frozen pre-merger forward pass per
+          train+test image, run ONCE per call regardless of design or corruption count; and
+      (2) the per-corruption work, which BOTH designs run once for EACH requested corruption
+          (`for cname in corruptions:` in run_design_a/b) -- so this multiplies the per-corruption
+          cost by `n_corruptions`.
+    An earlier version of this function omitted (1) and the `n_corruptions` factor in (2), which
+    UNDERCOUNTED the true cost by roughly `len(corruptions)` (2x at the default clean,jpeg_q70) --
+    the opposite of the conservative estimate a pre-spend budget gate is supposed to be. Callers
+    pass `n_corruptions=len(corruptions)` (`RunConfig.__post_init__` does)."""
+    if n_train_images < 0 or n_test_images < 0 or epochs < 0 or n_corruptions < 0:
         raise ValueError(
-            f"n_train_images ({n_train_images}), n_test_images ({n_test_images}), and epochs "
-            f"({epochs}) must all be >= 0"
+            f"n_train_images ({n_train_images}), n_test_images ({n_test_images}), epochs "
+            f"({epochs}), and n_corruptions ({n_corruptions}) must all be >= 0"
         )
+    # Both designs first run the palette=16/clean alignment sanity cell once: one frozen
+    # pre-merger forward pass per train+test image (Design-A-priced -- no backprop).
+    alignment_seconds = (n_train_images + n_test_images) * DESIGN_A_SECONDS_PER_IMAGE
     if design == "a":
-        return (n_train_images + n_test_images) * DESIGN_A_SECONDS_PER_IMAGE
+        per_corruption = (n_train_images + n_test_images) * DESIGN_A_SECONDS_PER_IMAGE
+        return alignment_seconds + n_corruptions * per_corruption
     if design == "b":
-        return (
+        per_corruption = (
             n_train_images * epochs * DESIGN_B_SECONDS_PER_TRAIN_STEP
             + n_test_images * DESIGN_B_SECONDS_PER_EVAL_IMAGE
         )
+        return alignment_seconds + n_corruptions * per_corruption
     raise ValueError(f"design must be 'a' or 'b', got {design!r}")
 
 
@@ -276,12 +293,16 @@ def estimate_cost_usd(
     n_test_images: int,
     epochs: int,
     gpu_hourly_rate_usd: float = GPU_HOURLY_RATE_USD_DEFAULT,
+    n_corruptions: int = 1,
 ) -> float:
     """Projected USD cost = projected hours * `gpu_hourly_rate_usd`. Pure Python, deterministic
-    for fixed inputs -- see `estimate_runtime_seconds` for the time half of this."""
+    for fixed inputs -- see `estimate_runtime_seconds` for the time half of this (including why
+    `n_corruptions` matters: a run trains/extracts once per requested corruption)."""
     if gpu_hourly_rate_usd < 0:
         raise ValueError(f"gpu_hourly_rate_usd must be >= 0, got {gpu_hourly_rate_usd!r}")
-    seconds = estimate_runtime_seconds(design, n_train_images, n_test_images, epochs)
+    seconds = estimate_runtime_seconds(
+        design, n_train_images, n_test_images, epochs, n_corruptions
+    )
     hours = seconds / 3600.0
     return hours * gpu_hourly_rate_usd
 
@@ -396,6 +417,7 @@ class RunConfig:
             self.n_test_images,
             self.epochs,
             self.gpu_hourly_rate_usd,
+            n_corruptions=len(self.corruptions),
         )
 
 

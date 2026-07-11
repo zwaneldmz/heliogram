@@ -180,6 +180,24 @@ def test_estimate_runtime_seconds_deterministic_and_monotonic():
     assert b_default_epochs > a1
 
 
+def test_estimate_runtime_scales_with_corruptions_and_includes_alignment():
+    """The estimator must (a) count the one-time clean alignment sanity cell and (b) multiply the
+    per-corruption work by n_corruptions -- the fix for the earlier undercount that ignored both,
+    understating a pre-spend budget gate's projected cost by ~len(corruptions)."""
+    per_corr_a = (6 + 3) * tma.DESIGN_A_SECONDS_PER_IMAGE
+    a1 = tma.estimate_runtime_seconds("a", 6, 3, 60, n_corruptions=1)
+    a2 = tma.estimate_runtime_seconds("a", 6, 3, 60, n_corruptions=2)
+    # alignment cell is present even at n_corruptions=1 (alignment + one per-corruption block)
+    assert a1 == (6 + 3) * tma.DESIGN_A_SECONDS_PER_IMAGE + per_corr_a
+    # each extra corruption adds exactly one more per-corruption block
+    assert a2 - a1 == per_corr_a
+    # Design B scales its training block by corruption count the same way
+    per_corr_b = 6 * 60 * tma.DESIGN_B_SECONDS_PER_TRAIN_STEP + 3 * tma.DESIGN_B_SECONDS_PER_EVAL_IMAGE
+    b1 = tma.estimate_runtime_seconds("b", 6, 3, 60, n_corruptions=1)
+    b2 = tma.estimate_runtime_seconds("b", 6, 3, 60, n_corruptions=2)
+    assert b2 - b1 == per_corr_b
+
+
 def test_estimate_runtime_seconds_rejects_unknown_design():
     with pytest.raises(ValueError, match="design"):
         tma.estimate_runtime_seconds("c", n_train_images=1, n_test_images=1, epochs=1)
@@ -269,8 +287,10 @@ def test_build_run_config_parses_corruptions_and_computes_cost():
     assert config.corruptions == ("clean", "jpeg_q70")
     assert config.design == "a"
     assert config.palette == 16
+    # __post_init__ passes n_corruptions=len(corruptions) (2 here: clean,jpeg_q70), because a
+    # run extracts/trains once per requested corruption -- so the consistency check must too.
     assert config.estimated_cost_usd == tma.estimate_cost_usd(
-        "a", 6, 3, 60, tma.GPU_HOURLY_RATE_USD_DEFAULT
+        "a", 6, 3, 60, tma.GPU_HOURLY_RATE_USD_DEFAULT, n_corruptions=2
     )
 
 

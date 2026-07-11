@@ -433,20 +433,25 @@ could recover it regardless of training).
 `tests/test_merger_adapter_contract_cpu.py`) is the authoritative estimate here, not a
 number recomputed independently in this runbook:
 
+The estimator counts the one-time palette=16/clean alignment sanity cell **and** multiplies the
+per-corruption work by `len(corruptions)` — both designs re-extract/re-train once per requested
+corruption (`for cname in corruptions:`), so `estimate_cost_usd`/`RunConfig.__post_init__` pass
+`n_corruptions=len(corruptions)`.
+
 - **Design A** (`DESIGN_A_SECONDS_PER_IMAGE = 0.5`s): one frozen forward pass per image, no
-  backprop — at the CLI's default `--n-train-images 6 --n-test-images 3`, that is
-  `estimate_cost_usd("a", 6, 3, epochs)` ≈ 4.5s of GPU time regardless of epoch count (the numpy
-  head-fit epochs are CPU-side and excluded from the GPU estimate) — cents, not dollars, at the
-  default `$2`/GPU-hour rate. Cheap enough that it should always be run before Design B.
+  backprop — at the CLI's default `--n-train-images 6 --n-test-images 3` and the default two
+  corruptions (`clean,jpeg_q70`), that is the alignment cell (`(6+3)·0.5 = 4.5`s) plus one
+  per-corruption extraction block per corruption (`2 · 4.5 = 9`s) ≈ **13.5s** of GPU time —
+  cents, not dollars, at the default `$2`/GPU-hour rate. Cheap enough that it should always be
+  run before Design B.
 - **Design B** (`DESIGN_B_SECONDS_PER_TRAIN_STEP = 2.5`s per training image per epoch, plus
   `DESIGN_B_SECONDS_PER_EVAL_IMAGE = 0.5`s per eval image): real backprop through the merger
-  LoRA/adapter parameters across `--epochs` passes. At the CLI's shared `--epochs` default (60)
-  and `--n-train-images 6 --n-test-images 3`, `estimate_cost_usd("b", 6, 3, 60)` ≈ 900s ≈ 0.25
-  GPU-hours ≈ **$0.50 at $2/GPU-hour for one corruption** — note the estimator takes a single
-  `epochs`/image count and does **not** itself multiply by `len(corruptions)`, even though
-  `run_design_b`'s real loop trains once per requested corruption, so the true cost for the
-  default two corruptions (`clean,jpeg_q70`) is roughly **2×** this printed estimate (~$1), a gap
-  worth knowing about before trusting the printed number at face value. Reaching the
+  LoRA/adapter parameters across `--epochs` passes. At the CLI's shared `--epochs` default (60),
+  `--n-train-images 6 --n-test-images 3`, and the default two corruptions,
+  `estimate_cost_usd("b", 6, 3, 60, n_corruptions=2)` ≈ the alignment cell (`4.5`s) plus
+  `2·(6·60·2.5 + 3·0.5) = 2·901.5 ≈ 1803`s ≈ 0.5 GPU-hours ≈ **~$1 at $2/GPU-hour** for the two
+  default corruptions (the per-corruption multiplier is now included in the printed estimate, not
+  a gap to correct for by hand). Reaching the
   **tens-of-dollars** range this section's title refers to requires deliberately scaling up
   `--n-train-images`/`--epochs` beyond the tiny diagnostic defaults (e.g. dozens of images and
   hundreds of epochs) for a more thorough gate run — the script's own module docstring is
@@ -456,8 +461,8 @@ number recomputed independently in this runbook:
   `--budget-cap-usd` (default `$40` — the same tens-of-dollars ceiling `RUNBOOK-GPU.md` section
   2.5 already uses for the full p16 merger curriculum, `BUDGET_CAP_USD_DEFAULT`'s own comment
   cites it directly) — this cap is a ceiling not to exceed, not a target cost; raise it
-  explicitly only after reviewing the printed projected cost (and remembering the
-  per-corruption multiplier above), never silently.
+  explicitly only after reviewing the printed projected cost (which now already includes the
+  per-corruption multiplier and the alignment cell), never silently.
 
 **Reading the result:** per the script's own `HONEST_CAVEAT_TEXT` — a trained readout head is
 not the language model. Design-B success (error at/below the RS budget, or clearly below the
