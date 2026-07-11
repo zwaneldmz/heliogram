@@ -8,8 +8,19 @@ Phase 1). Safe to run in this repo's CPU-only pytest environment; it is what gen
 scripts/train_qlora.py's curriculum stages consume.
 
 Every image/target pair this writes is ground truth by construction (heliogram.codec.encode()
-writes a known symbol grid; heliogram.codec.extract_symbols() reads it back off the clean image
-before any corruption augmentation is applied) -- see heliogram/dataset.py's module docstring.
+writes a known symbol grid; heliogram.codec.extract_symbols() reads it back off the clean,
+EVEN-PATCH-GRID-PADDED image before any corruption augmentation is applied) -- see
+heliogram/dataset.py's module docstring.
+
+PROCESSOR RESIZE HAZARD (D4 of the Phase-2 scaffold review -- see heliogram/dataset.py's
+"PROCESSOR RESIZE HAZARD" module-docstring note and `pad_to_even_patch_grid`'s own docstring for
+the full argument): every image this script writes has BOTH patch-grid dimensions (width/height
+in `--patch-size`-px units) padded to even, so its pixel dimensions are already exact multiples
+of `patch_size * 2` -- the alignment Qwen2-VL/Qwen2.5-VL's image processor's `smart_resize` step
+requires to be a no-op. This is not optional and has no flag to disable it: an odd patch-count
+dimension is silently resampled OFF the heliogram symbol lattice the moment the image reaches the
+processor (see `scripts/train_qlora.py`'s `_assert_processor_alignment`, which asserts this
+guarantee actually held by the time an image gets there).
 
 DEFAULTS (Slice C retarget -- see heliogram/dataset.py's module docstring "THE BET" paragraph):
 `--palettes` now defaults to `DEFAULT_PALETTES` (64, 128, 256 -- where decode_pixels is MEASURED
