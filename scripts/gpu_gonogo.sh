@@ -23,27 +23,33 @@ set -euo pipefail
 
 MODEL_ID="${1:-Qwen/Qwen2.5-VL-3B-Instruct}"
 OUTDIR="${OUTDIR:-gpu_gonogo_out}"
+# DEVICE/DTYPE overrides: forward-only probe + Design A run fine on CPU, which is the escape
+# hatch when the installed torch has no kernels for the GPU (e.g. torch 2.5.1 on an RTX 5090 /
+# Blackwell sm_120). CPU is slower but gets the decisive go/no-go. Example:
+#   DEVICE=cpu DTYPE=float32 bash scripts/gpu_gonogo.sh
+DEVICE="${DEVICE:-cuda}"
+DTYPE="${DTYPE:-bfloat16}"
 cd "$(dirname "$0")/.."
 mkdir -p "$OUTDIR"
 
-echo "### model: $MODEL_ID"
+echo "### model: $MODEL_ID   device: $DEVICE   dtype: $DTYPE"
 echo "### outputs -> $OUTDIR/"
 
 echo
 echo "### [1/3] pre-merger palette=16 LINEAR probe  (ALIGNMENT GATE -- expect clean ~0.1344)"
-python scripts/run_probe.py --model-id "$MODEL_ID" \
+python scripts/run_probe.py --model-id "$MODEL_ID" --device "$DEVICE" --dtype "$DTYPE" \
     --probe-stage pre_merger --palettes 16 --corruptions clean,jpeg_q70 \
     --out "$OUTDIR/probe_pre_p16.md" --json "$OUTDIR/probe_pre_p16.json"
 
 echo
 echo "### [2/3] post-merger palette=16 LINEAR probe  (expect at/near chance ~0.66-0.74)"
-python scripts/run_probe.py --model-id "$MODEL_ID" \
+python scripts/run_probe.py --model-id "$MODEL_ID" --device "$DEVICE" --dtype "$DTYPE" \
     --probe-stage merged --palettes 16 --corruptions clean \
     --out "$OUTDIR/probe_post_p16.md" --json "$OUTDIR/probe_post_p16.json"
 
 echo
 echo "### [3/3] Design A: frozen-feature nonlinear readout  (the cheap go/no-go)"
-python scripts/drive_merger_adapter.py --design a \
+python scripts/drive_merger_adapter.py --design a --device "$DEVICE" --dtype "$DTYPE" \
     --model-id "$MODEL_ID" --palette 16 --corruptions clean,jpeg_q70 \
     --out "$OUTDIR/design_a.json"
 
