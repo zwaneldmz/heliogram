@@ -1,5 +1,98 @@
 # heliogram
 
+> A defensive-security research artifact built around a measured negative result: can a
+> patch-aligned optical codec carry high-entropy bytes more cheaply than text through a
+> self-hosted vision-language model? Measured on two independent channels — no.
+
+## Summary
+
+heliogram encodes arbitrary bytes as a grid of solid-color 14×14 blocks — one symbol per
+ViT patch, protected by Reed–Solomon ECC — to test one economic hypothesis: could such a
+patch-aligned optical codec pack more payload bits per vision token than base64/ascii85 text
+costs per text token, making encoded images a cheaper context medium for a self-hosted VLM
+(target: **Qwen2.5-VL**)? The hypothesis was measured, not assumed, on two independent
+channels, and **both say no**: the codec's own density ceiling sits below the real
+tokenizer's text bar, and the model's own vision pipeline actively discards the per-patch
+structure before any language model sees it. What survives the negative result is the
+instrumentation built to reach it — a model-free **pre-ingest detector** (with a measured
+adversarial blind spot), a reusable pre/post-merger **information-localization probe method**,
+and a **threat model** scoped to Qwen2.5-VL. All data is synthetic and seed-deterministic.
+Apache-2.0.
+
+## Architecture
+
+The project is a two-channel measurement design: encode a payload, push it through a realistic
+corruption suite, then ask two independent questions — *is it dense enough?* (model-free) and
+*does the structure survive the model?* (frozen tower + linear probe). A defensive detector is
+built from the same structural signature the codec produces.
+
+```mermaid
+flowchart LR
+  P[Payload bytes] --> E["Color codec<br/>RS ECC + palette"]
+  E --> G[heliogram grid]
+  G --> C["Corruption suite<br/>resize · JPEG · crop/pad · smart_resize"]
+
+  C --> C1{{"Channel 1<br/>model-free decoder"}}
+  C --> C2{{"Channel 2<br/>frozen Qwen2.5-VL tower"}}
+
+  C1 --> R1["Density vs. real text bar<br/><b>verdict: negative</b>"]
+
+  C2 --> PRE["pre-merger tap"]
+  C2 --> POST["post-merger tap"]
+  PRE --> R2["Linear-probe error<br/>vs. RS budget<br/><b>verdict: negative</b>"]
+  POST --> R2
+
+  G -.same structural signature.-> D["foreign_tile detector<br/><i>defensive instrument</i>"]
+
+  R1 --> LOG[("RESULTS.md · results.csv")]
+  R2 --> RPT[("probe_report*.md")]
+```
+
+## Pipeline
+
+The codec's encode → wire → decode path. `align=2` rounds the grid to even patch dimensions so
+Qwen2.5-VL's mandatory `smart_resize` becomes a no-op (a real robustness finding — without it,
+decode drops to zero); the reference decoder samples patch centers only, deliberately measuring
+the channel rather than decoder cleverness.
+
+```mermaid
+flowchart LR
+  A[bytes] --> B["frame<br/>version + length"]
+  B --> D["Reed–Solomon ECC<br/>(default 32 parity)"]
+  D --> F["split into<br/>log2 P -bit symbols"]
+  F --> H["map to palette<br/>of P colors"]
+  H --> I["paint 1 symbol / 14×14 patch<br/>+ row-0 calibration"]
+  I --> J["align=2 →<br/>smart_resize no-op"]
+  J -.corruption.-> K["decode_pixels<br/>sample patch centers"]
+  K --> L["RS verify →<br/>recovered bytes"]
+```
+
+## Results at a glance
+
+Both channels return negative. The codec's net density ceiling falls below *every* measured text
+baseline, and at the LM boundary (post-merger) the linear probe sits at/near chance — a real
+partial signal exists on the raw ViT blocks (pre-merger) but the patch merger erases it.
+
+| Channel | What was measured | Result | Bar / budget | Verdict |
+|---|---|---:|---|:--:|
+| 1 — density | Net codec ceiling, `subpatch=1` (bits/patch) | **6.996** | 8.096 base64 · 8.374 ascii85 (bits/token) | ❌ below every text bar |
+| 2 — post-merger | Probe error at LM boundary (3B, palette 16, clean) | **0.7358** | 0.0627 RS budget · 0.9375 chance | ❌ at/near chance |
+| 2 — pre-merger | Probe error on ViT-block output (3B, palette 16, clean) | **0.1344** | 0.0627 RS budget · 0.9375 chance | ⚠️ partial signal, then erased by merger |
+
+Full sweep tables and the per-tap-point breakdown are in the detailed discussion below.
+
+### Read next
+
+- **The verdict without the sweep tables** — [`docs/FINDINGS.md`](docs/FINDINGS.md)
+- **Full paper-style report** (background, methods, discussion) — [`docs/writeup.md`](docs/writeup.md)
+- **Defensive framing** (what the detector catches, what it does not, scope) — [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md)
+- **Raw measurement logs** — [`RESULTS.md`](RESULTS.md) / `results.csv`
+- **Wire format** — [`spec/format-v0.1.md`](spec/format-v0.1.md)
+
+---
+
+## Overview
+
 **Primarily, this is a defensive-security research artifact: a structural,
 model-free pre-ingest detector for heliogram-like payloads (now with a measured
 adversarial blind spot), a threat model scoped to Qwen2.5-VL, and a reusable
@@ -26,15 +119,6 @@ against a task-derived decision budget — is what generalizes into the reusable
 probe method above; and the exact structural signature the codec produces
 (even patch tiling, near-solid cells) is what the pre-ingest detector in
 [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) is built to catch.
-
-If you want the verdict on the economic question without the sweep tables, read
-[`docs/FINDINGS.md`](docs/FINDINGS.md). For the full paper-style version with
-background, methods, and discussion, read [`docs/writeup.md`](docs/writeup.md).
-For the defensive framing — what the detector catches, what it measurably does
-not, and what is out of scope — read
-[`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md). The raw measurement logs are in
-[`RESULTS.md`](RESULTS.md) and `results.csv`; the wire format is
-[`spec/format-v0.1.md`](spec/format-v0.1.md).
 
 Apache-2.0. All data is synthetic and seed-deterministic.
 
