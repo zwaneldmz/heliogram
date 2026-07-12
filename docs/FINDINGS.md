@@ -203,7 +203,10 @@ Reading this table with the two tap points side by side is the whole finding:
 > merger (≈0.07 pre-merger → 0.66–0.74 post-merger). This is **one CPU/fp32 run**
 > (`gpu_gonogo_out/probe_pre_big.json`); it does not yet revise the headline
 > `probe_report*.md` numbers, which stand until an independent GPU run reproduces
-> the ~0.07. The same run's Design-A nonlinear quad readout landed at 0.157
+> the ~0.07. (The *reference-config* 0.1344 itself IS now GPU-confirmed: the
+> 2026-07-12 RTX 4090 CUDA/bf16 session reproduced it exactly — 0.13442 — five
+> independent times as the merger-adapter runs' alignment gate, see
+> `gpu_gonogo_out/`; the 48-image ~0.07 estimate remains CPU-only/unreplicated.) The same run's Design-A nonlinear quad readout landed at 0.157
 > (train 0.000) — still data-limited on the harder joint 4-symbol task, i.e. a
 > floor-not-a-ceiling, consistent with the 0.07 per-patch estimate.
 - **`palette=2`/`4` (the easiest, lowest-bit-depth codes) leave a comparable
@@ -327,9 +330,21 @@ a future model — not a demonstrated exploit.
   Design A, a frozen-feature nonlinear readout diagnostic; Design B, an
   actual trainable-merger LoRA/adapter gate), reusing the probe's exact
   window-shuffle alignment code and re-checking against the committed
-  `probe_report_premerger.md` numbers before trusting anything new. It has
-  **not been run** — no GPU exists in this environment — so the merger-only
-  go/no-go remains open, scoped to Qwen2.5-VL, `palette=16` only.
+  `probe_report_premerger.md` numbers before trusting anything new. **This has
+  now been run against real weights** (2026-07-12, RTX 4090, CUDA/bf16, 3B;
+  raw artifacts in `gpu_gonogo_out/`, full reading in `RUNBOOK-GPU.md`
+  "Session-3 verdict") **and the answer is no**: Design A confirms the merger
+  input still carries the symbols (nonlinear quad readout 0.2464 clean at
+  24 train images, train error ~0, i.e. a data-limited floor), but the
+  trainable merger itself — both a rank-32 LoRA delta (B1) and a parallel
+  full-rank adapter (B2) — plateaus at **0.375–0.392 clean symbol error**:
+  below the stock frozen-merger baseline (0.6551–0.7358, so training does
+  recover *coarse* signal), but ~6× above the 0.0627 RS budget, above Design
+  A's own frozen-input floor, and above even the 0.1344 frozen pre-merger
+  *linear* readout. A cheaply-trained, code-aware merger cannot carry the
+  `palette=16` signal to the LM boundary, scoped to Qwen2.5-VL. The
+  still-unmeasured escalations shrink to: a full (non-cheap) merger retrain,
+  or fine-tuning the vision blocks themselves.
 - A **different code** (different palette design, different patch geometry,
   a learned encoding rather than a hand-designed one) could interact with the
   vision blocks and merger differently; nothing here bounds codes not tested.
@@ -395,10 +410,14 @@ apply the pre-committed decision rule to the result. That run requires a GPU
 this environment does not have and a fine-tuned reader that does not exist
 yet; it is out of scope for this document and is not performed here.
 
-A cheaper, intermediate step already exists to gate whether that full run is
+A cheaper, intermediate step already existed to gate whether that full run is
 even worth its cost: `scripts/train_merger_adapter.py`'s Design A/Design B
-merger-only go/no-go (§5, above) would settle whether a trainable merger can
+merger-only go/no-go (§5, above), settling whether a trainable merger can
 recover the `palette=16` signal the frozen merger is measured to erase,
 before spending the tens-of-GPU-hours a full behavioral fine-tune curriculum
-would cost. It is designed and staged, refuses without a model, and has not
-been run.
+would cost. **That gate has now been run (2026-07-12, ~$1–2 of GPU time; §5
+above, `gpu_gonogo_out/`, `RUNBOOK-GPU.md` "Session-3 verdict") and came back
+NO-GO** — the trainable merger plateaus ~6× above the RS budget — so the full
+behavioral fine-tune run this section describes is not merely unfunded but
+now measured to be unsupported: the cheap gate that was designed to spare its
+cost did exactly that.

@@ -166,6 +166,14 @@ possible, but bet accordingly. (e) sets the max economical palette if (d) passes
 
 ### If (d)/(e) pass: the P=16 merger experiment
 
+> **Superseded by Session 3 (2026-07-12): do not run this curriculum.** The cheaper,
+> more direct test of the same premise — section 7's Design A/B merger-adapter go/no-go —
+> has since been run on real weights and came back **NO-GO** (trained merger plateaus at
+> ~0.38 symbol error, ~6× over budget and above the frozen 0.1344 pre-merger linear
+> readout this curriculum's own 86.6% decision rule is anchored to). See the Session-3
+> verdict in section 7. The (d)/(e) scans below and the curriculum they gate are retained
+> for the record only.
+
 `scripts/train_qlora.py` has a second curriculum builder,
 `build_p16_merger_curriculum()`, retargeted to exactly this narrow case — palette=16,
 `subpatch=1` throughout, never the dead `DEFAULT_PALETTES={64,128,256}` regime. Select it
@@ -485,6 +493,65 @@ uses those symbols, or that the economics ultimately win. If Design B stays at o
 frozen-merger baseline despite training, the negative result is **stronger** than Step 0's own
 merged-probe fail: even a cheaply-trained, code-aware merger cannot carry the signal, scoped to
 Qwen2.5-VL.
+
+### Session-3 verdict (2026-07-12, RunPod RTX 4090, CUDA/bf16, 3B — raw artifacts in `gpu_gonogo_out/`)
+
+**This section HAS now been run against real weights. Verdict: NO-GO — the merger-adapter
+branch closes as a measured negative.** Every run below independently re-measured the
+alignment gate and reproduced the committed pre-merger number **exactly** (0.13442 vs
+target 0.1344) — also the first GPU/bf16 reproduction of `probe_report_premerger.md`'s
+CPU/fp32 headline, so version/dtype drift is ruled out for the whole session. The
+post-merger negative reproduced too (clean 0.7358, within the committed 0.66–0.74 band).
+
+The measurement ladder (palette=16, test symbol error; RS budget 0.0627, chance 0.9375):
+
+| # | measurement | config | clean | jpeg_q70 |
+|---|---|---|---|---|
+| 1 | pre-merger linear (info in the quad, frozen) | reference | 0.1344 | 0.1902 |
+| 2 | Design A: nonlinear readout of merger INPUT | 6/3 imgs | 0.4916 (train 0.000) | 0.4871 |
+| 3 | Design A, more data | 24/8 imgs | **0.2464** (train ~0.000) | 0.2680 |
+| 4 | Design B1: LoRA r8 merger + joint head | 20 ep, 24/8 | 0.5547 | 0.8849 |
+| 5 | Design B1, escalated | r32/α64, 80 ep, 48/12 | **0.3919** | **0.4100** |
+| 6 | Design B2: parallel adapter around frozen merger | 80 ep, 48/12 | **0.3752** | 0.9075 |
+| — | stock frozen merger, linear (post-merger) | reference | 0.6551–0.7358 | — |
+
+How the pre-committed rules read against this:
+
+- **Design A cleared its gate** — the merger input carries the symbols (rows 2→3: the
+  default-config 0.49 was pure small-sample overfit; 4× the data halved it to 0.2464 with
+  train error still ~0, i.e. 0.2464 is itself a data-limited floor-not-a-ceiling). So the
+  "info already gone at the merger input → stop" branch did NOT fire; Design B was run.
+- **Design B beat the stock baseline but nothing else.** Two independent mechanisms — a
+  low-rank delta inside the merger MLP (B1) and fresh full-rank parallel capacity around
+  it (B2) — plateau at **0.375–0.392 clean**, agreeing with each other. That is: (a) **6×
+  above the 0.0627 RS budget** (no decodable channel — Reed–Solomon at nsym=32 corrects
+  nothing at this error rate); (b) **worse than Design A's own 0.2464 frozen-input floor**
+  (the trainable merger never even matched a plain MLP reading its frozen input); (c)
+  **worse than the 0.1344 frozen pre-merger LINEAR readout** — so per section 2.5's
+  pre-committed "must beat 86.6% accuracy" rule, the trained merger added nothing a cheap
+  linear probe on frozen weights didn't already show.
+- **Honest rule-letter note:** section 7's weaker success clause ("clearly below the stock
+  frozen-merger baseline") technically fired — rows 5/6 sit well under 0.6551, so training
+  the merger demonstrably recovers *some* coarse signal. Recorded, not overturned: the
+  clause exists as a proxy for "the signal can be made recoverable at the LM boundary",
+  and the budget/floor comparisons above measure directly that it cannot — a ~0.38
+  symbol-error channel carries no byte-exact payload regardless of downstream cleverness.
+- **Run-quality caveats, so the negative is not overstated:** row 4 (r8/20ep) was
+  under-optimized (jpeg near chance, worse than stock) and is superseded by row 5; row 6's
+  jpeg cell (0.9075) is an optimization collapse of the B2 variant, not channel evidence —
+  B1's stable 0.4100 is the trustworthy corruption number. Design A's floor is
+  conservative (still data-limited), so "info present at the input, unextractable by a
+  cheap trained merger" is if anything understated.
+
+**Consequences:** the P=16-retargeted curriculum (section 2.5, `--curriculum p16_merger`)
+is NOT justified — its premise was that a trainable merger could approach the pre-merger
+signal, and the direct cheap test measured it stuck ~3× above even the frozen linear
+number. The scoped-to-Qwen2.5-VL negative chain is now complete and measured end to end:
+density bar (model-free) → frozen tower discards structure (Step 0) → scale doesn't rescue
+it (7B) → the loss localizes to the merger (2.5c) → **and a cheaply-trained, code-aware
+merger cannot recover it either (this section)**. Remaining unmeasured escalations (full
+merger retrain / vision-block fine-tune / learned encoders) are outside this project's
+cheap-gate scope and are documented as such in `docs/FINDINGS.md` §5.
 
 ## What to bring back into the repo
 

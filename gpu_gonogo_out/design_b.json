@@ -1,0 +1,31 @@
+{
+  "design": "B",
+  "variant": "B1",
+  "palette": 16,
+  "seed": 0,
+  "alignment_check_clean_pre_merger_symbol_error": 0.13442176870748299,
+  "alignment_check_target": 0.1344,
+  "alignment_check_source": "probe_report_premerger.md (see also docs/FINDINGS.md section 3)",
+  "stock_post_merger_baseline_range": [
+    0.6551,
+    0.7358
+  ],
+  "stock_post_merger_baseline_source": "probe_report.md (3B) / probe_report_7b.md (7B), see also docs/FINDINGS.md section 3",
+  "per_corruption": [
+    {
+      "corruption": "clean",
+      "symbol_error": 0.5546938627958298,
+      "rs_budget": 0.06274509803921569,
+      "below_rs_budget": false,
+      "below_stock_post_merger_baseline": true
+    },
+    {
+      "corruption": "jpeg_q70",
+      "symbol_error": 0.884897954761982,
+      "rs_budget": 0.06274509803921569,
+      "below_rs_budget": false,
+      "below_stock_post_merger_baseline": false
+    }
+  ],
+  "caveat": "A trained readout head is NOT the LM. Design-B success means the info CAN be made recoverable at the LM boundary by a cheap merger -- the go/no-go flips to 'go' and the fine-tune question REOPENS -- it does NOT prove the LM zero-shot uses those symbols or that the economics win. Necessary, not sufficient. If Design B stays well above budget (RS budget and/or the stock frozen-merger baseline), the negative result is STRONGER than Step 0's own merged-probe fail: even a cheaply-trained, code-aware merger can't carry the signal -- scoped to Qwen2.5-VL."
+}

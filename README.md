@@ -200,12 +200,15 @@ This is the route the earlier roadmap called "the entire load-bearing wall of th
 project's economic case" — reading multiple patch-symbols out of one merged LM
 token. The probe measured it directly and it is not there. The fine-tune that
 route implied is therefore **not pursued**; the cheap Step-0 experiment that would
-have gated it came back negative for tens of dollars, exactly as intended. (A
+have gated it came back negative for tens of dollars, exactly as intended. (The
 narrower question the frozen-tower probe does not settle — whether a *cheaply
 trained* merger, rather than the stock frozen one, could carry the pre-merger
-partial signal through to the LM boundary — is staged as a designed,
-refuse-without-model go/no-go that has not been run here; see the Reproducing
-section and `scripts/train_merger_adapter.py`.)
+partial signal through to the LM boundary — has now been measured too, on a
+rented GPU for ~$1–2, and the answer is **also no**: a trained merger — LoRA
+r32 and a parallel adapter, independently — plateaus at ~0.38 symbol error,
+under the stock frozen-merger baseline but ~6× above the RS decode budget and
+above even the frozen pre-merger linear readout. See `RUNBOOK-GPU.md`
+"Session-3 verdict" and `gpu_gonogo_out/`.)
 
 **The typography pivot fails too, for a different reason.** The natural fallback —
 render the payload as dense typeset ascii85, the channel towers demonstrably read
@@ -375,13 +378,14 @@ pytest -q                         # full CPU test suite
 ```
 
 The merger-only adapter go/no-go (Task 2 following on from the frozen-tower
-probe) is now **scaffolded** — designed and CPU-testable, but refuses to run
-without a real loaded model/weights, and has not been run against real weights
-in this repo (no GPU here):
+probe) has been **run against real weights** (2026-07-12, RTX 4090, CUDA/bf16,
+3B) and came back **NO-GO** — raw artifacts in `gpu_gonogo_out/`, full decision-
+rule reading in `RUNBOOK-GPU.md` "Session-3 verdict". To reproduce:
 
 ```bash
-python scripts/train_merger_adapter.py --help   # design A/B go/no-go scaffold;
-                                                 # every real-run path raises
+bash scripts/gpu_gonogo.sh Qwen/Qwen2.5-VL-3B-Instruct   # gate + probes + Design A
+python scripts/train_merger_adapter.py --help   # design A/B scaffold; every
+                                                 # real-run path raises
                                                  # ValueError on model=None
 ```
 
@@ -408,8 +412,9 @@ fine-tune scaffold (`heliogram/dataset.py`, `scripts/train_qlora.py`,
 frozen-tower probe already answered its go/no-go in the negative.
 `scripts/train_merger_adapter.py` is a separate, narrower scaffold (the
 merger-only go/no-go: can a *cheaply trained* merger, not just the stock frozen
-one, preserve the pre-merger partial signal?) — designed and CPU-tested, but,
-like the rest of the GPU path, has not been run against real weights here.
+one, preserve the pre-merger partial signal?) — designed, CPU-tested, and now
+also **measured on real weights: NO-GO** (`RUNBOOK-GPU.md` "Session-3 verdict",
+`gpu_gonogo_out/`).
 
 ## Repository map
 
